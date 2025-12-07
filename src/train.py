@@ -22,7 +22,7 @@ parser.add_argument('--num_epochs', default=10, type=int)
 parser.add_argument('--batch_size', default=64, type=int)
 parser.add_argument('--learning_rate', default=1e-4, type=float)
 parser.add_argument('--patch_size', default=32, type=int)
-
+parser.add_argument('--split', default='train', type=str)
 
 parser.add_argument('--seed', default=666, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
@@ -79,7 +79,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
         # 前向传播
         optimizer.zero_grad()
         outputs = model(inputs)
-        loss = criterion(outputs, labels)
+        loss = criterion(outputs.ravel(), labels.float())
         
         # 反向传播
         loss.backward()
@@ -87,9 +87,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
         
         # 统计信息
         running_loss += loss.item()
-        _, predicted = outputs.max(1)
+        probs = torch.sigmoid(outputs).squeeze()
+        predicted = (probs > 0.5).long()
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
+        if epoch == 9:
+            print(probs)
+            print(predicted)
+            print(labels)
         
         # 更新进度条显示
         avg_loss = running_loss / (batch_idx + 1)
@@ -128,11 +133,13 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs):
             
             # 前向传播
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs.ravel(), labels.float())
             
             # 统计信息
             running_loss += loss.item()
-            _, predicted = outputs.max(1)
+
+            probs = torch.sigmoid(outputs).squeeze()
+            predicted = (probs > 0.5).long()
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
             
@@ -209,7 +216,7 @@ def main():
     model = model.to(device)
     
     # 定义损失函数和优化器
-    criterion = nn.CrossEntropyLoss()
+    bce = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     
     # 学习率调度器
@@ -237,12 +244,12 @@ def main():
         
         # 训练
         train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, args.num_epochs
+            model, train_loader, bce, optimizer, device, epoch, args.num_epochs
         )
         
         # 验证
         val_loss, val_acc, cm, report = validate_epoch(
-            model, val_loader, criterion, device, epoch, args.num_epochs
+            model, val_loader, bce, device, epoch, args.num_epochs
         )
         
         # 更新学习率

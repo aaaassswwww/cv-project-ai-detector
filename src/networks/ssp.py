@@ -10,7 +10,7 @@ class ssp(nn.Module):
         super().__init__()
         self.srm = SRMConv2d_simple()
         self.disc = resnet50(pretrained=True)
-        self.disc.fc = nn.Linear(2048, 2)
+        self.disc.fc = nn.Linear(2048, 1)
 
     def forward(self, x):
         x = F.interpolate(x, (256, 256), mode='bilinear')

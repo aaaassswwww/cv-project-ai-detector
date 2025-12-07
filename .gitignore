@@ -3,3 +3,6 @@
 /training_history.png
 /src/__pycache__
 /src/networks/__pycache__
+/*.csv
+
+
