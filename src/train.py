@@ -91,10 +91,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
         predicted = (probs > 0.5).long()
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-        if epoch == 9:
-            print(probs)
-            print(predicted)
-            print(labels)
         
         # 更新进度条显示
         avg_loss = running_loss / (batch_idx + 1)
