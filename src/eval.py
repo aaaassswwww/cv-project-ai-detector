@@ -89,12 +89,15 @@ def main():
     root_images = os.path.join(args.dataset_root, args.split)
     image_paths = []
     predictions = []
+    filenames = []
     class_dir = root_images
     for filename in os.listdir(class_dir):
         img_path = os.path.join(class_dir, filename)
         image_paths.append(img_path)
+        filenames.append(filename)
 
     image_paths = natsorted(image_paths)
+    filenames = natsorted(filenames)
 
 
     for img_path in image_paths:
@@ -104,7 +107,7 @@ def main():
         prediction = predict(model, image, device)
         predictions.append(prediction)
 
-    save_results(image_paths, predictions, args.output_file)
+    save_results(filenames, predictions, args.output_file)
 
 if __name__ == '__main__':
     main()
