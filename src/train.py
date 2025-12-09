@@ -7,6 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import argparse
 import time
+import logging
 
 from torchvision import transforms, models
 import matplotlib.pyplot as plt
@@ -15,19 +16,26 @@ from dataset import Dataset
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 from patch import patch_img
 from networks.ssp import ssp
+from utils.util import set_seed, init_logger, make_worker_init_fn
+from utils.loss import build_loss
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--num_epochs', default=10, type=int)
 parser.add_argument('--batch_size', default=64, type=int)
 parser.add_argument('--learning_rate', default=1e-4, type=float)
+parser.add_argument('--weight_decay', default=1e-4, type=float)
 parser.add_argument('--patch_size', default=32, type=int)
 parser.add_argument('--split', default='train', type=str)
 
-parser.add_argument('--seed', default=666, type=int, help='random seed')
+parser.add_argument('--seed', default=42, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
 parser.add_argument('--output_dir', default='checkpoints', type=str, help='output directory')
 parser.add_argument('--model_name', default='ssp', type=str)
+parser.add_argument('--warmup_epochs', default=3, type=int, help='warmup epochs')
+parser.add_argument('--early_stop_patience', default=8, type=int, help='early stopping patience (epochs)')
+parser.add_argument('--min_delta', default=1e-4, type=float, help='minimum val loss improvement to reset patience')
+parser.add_argument('--eta_min', default=1e-6, type=float, help='minimum lr for cosine annealing')
 
 args = parser.parse_args()
 
@@ -166,27 +174,39 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs):
 def main():
     # 设置设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU型号: {torch.cuda.get_device_name(0)}")
-        print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB")
+    set_seed(args.seed)
+    
     
     # 创建保存目录
     os.makedirs(args.output_dir, exist_ok=True)
+    model_dir = os.path.join(args.output_dir, args.model_name)
+    os.makedirs(model_dir, exist_ok=True)
+
+    logger = init_logger(os.path.join(model_dir, 'train.log'))
+    logger.info(f"Using device: {device}")
+    if torch.cuda.is_available():
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB")
     
     
     # 创建数据集和数据加载器
-    print("\n" + "="*50)
-    print("加载数据集...")
+    logger.info("="*50)
+    logger.info("Loading datasets...")
     train_dataset = Dataset(args=args, split='train',transforms=train_transform)
     
     val_dataset = Dataset(args=args,split='val',transforms=train_transform)
     
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
+
+    worker_init_fn = make_worker_init_fn(args.seed)
+
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
         shuffle=True, 
         num_workers=4,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )
     
     val_loader = DataLoader(
@@ -194,30 +214,32 @@ def main():
         batch_size=args.batch_size, 
         shuffle=False, 
         num_workers=4,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )
     
-    print(f"训练集: {len(train_dataset)} 张图像")
-    print(f"验证集: {len(val_dataset)} 张图像")
+    logger.info(f"Train set: {len(train_dataset)} images | Val set: {len(val_dataset)} images")
     
     # 检查数据均衡性
     real_count = train_dataset.labels.count(0)
     fake_count = train_dataset.labels.count(1)
-    print(f"训练集类别分布 - 真实: {real_count}, AI生成: {fake_count}")
+    logger.info(f"Train class balance - Real: {real_count}, AI-generated: {fake_count}")
     
     # 构建模型
-    print("\n" + "="*50)
-    print("构建模型...")
+    logger.info("="*50)
+    logger.info("Building model...")
     # model = build_resnet50_model(num_classes=2)
     model = ssp()
     model = model.to(device)
     
     # 定义损失函数和优化器
-    bce = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    bce = build_loss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
-    # 学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+    # 学习率调度器: warmup + 余弦退火
+    cosine_t_max = max(1, args.num_epochs - args.warmup_epochs)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cosine_t_max, eta_min=args.eta_min
     )
     
     # 训练历史记录
@@ -228,9 +250,11 @@ def main():
     }
     
     # 训练循环
-    print("\n" + "="*50)
-    print("开始训练...")
+    logger.info("="*50)
+    logger.info("Start training...")
     best_val_acc = 0.0
+    best_val_loss = float('inf')
+    no_improve_epochs = 0
     
     # 创建epoch级别的进度条
     epoch_pbar = tqdm(range(args.num_epochs), desc="总进度", unit="epoch")
@@ -238,6 +262,13 @@ def main():
     for epoch in epoch_pbar:
         epoch_start_time = time.time()
         
+        # Warmup: 线性提升到基础学习率
+        if epoch < args.warmup_epochs:
+            warmup_lr = args.learning_rate * (epoch + 1) / max(1, args.warmup_epochs)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+            logger.info(f"Warmup epoch {epoch+1}/{args.warmup_epochs} | LR {warmup_lr:.6f}")
+
         # 训练
         train_loss, train_acc = train_epoch(
             model, train_loader, bce, optimizer, device, epoch, args.num_epochs
@@ -248,8 +279,9 @@ def main():
             model, val_loader, bce, device, epoch, args.num_epochs
         )
         
-        # 更新学习率
-        scheduler.step(val_loss)
+        # 更新学习率（warmup 之后再使用余弦退火）
+        if epoch >= args.warmup_epochs:
+            scheduler.step()
         
         # 记录历史
         history['train_loss'].append(train_loss)
@@ -270,49 +302,65 @@ def main():
         })
         
         # 打印详细结果
-        print(f"\nEpoch {epoch+1}/{args.num_epochs} 结果:")
-        print(f"  训练 - 损失: {train_loss:.4f}, 准确率: {train_acc:.2f}%")
-        print(f"  验证 - 损失: {val_loss:.4f}, 准确率: {val_acc:.2f}%")
-        print(f"  混淆矩阵:\n{cm}")
-        print(f"  学习率: {optimizer.param_groups[0]['lr']:.6f}")
-        print(f"  耗时: {epoch_time:.1f}秒")
+        logger.info(
+            f"Epoch {epoch+1}/{args.num_epochs} | "
+            f"Train Loss {train_loss:.4f} Acc {train_acc:.2f}% | "
+            f"Val Loss {val_loss:.4f} Acc {val_acc:.2f}% | "
+            f"LR {optimizer.param_groups[0]['lr']:.6f} | "
+            f"Time {epoch_time:.1f}s"
+        )
+        logger.info(f"Confusion matrix:\n{cm}")
         
-        # 保存最佳模型
-        if val_acc > best_val_acc:
+        # 保存最佳模型（以验证损失为准，支持早停）
+        if val_loss + args.min_delta < best_val_loss:
+            best_val_loss = val_loss
             best_val_acc = val_acc
-            model_path = os.path.join(args.output_dir, args.model_name)
-            model_path = os.path.join(model_path, 'ai-detector_best.pth')
+            no_improve_epochs = 0
+            best_path = os.path.join(model_dir, 'ai-detector_best.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'val_acc': val_acc,
                 'val_loss': val_loss,
                 'train_acc': train_acc,
                 'train_loss': train_loss,
-            }, model_path)
-            print(f"  ✓ 保存最佳模型到: {model_path} (准确率: {val_acc:.2f}%)")
+                'args': vars(args),
+            }, best_path)
+            logger.info(f"✓ Saved best model to: {best_path} (ValLoss {val_loss:.4f}, ValAcc {val_acc:.2f}%)")
+        else:
+            no_improve_epochs += 1
+            logger.info(f"↻ No significant val improvement ({no_improve_epochs}/{args.early_stop_patience})")
         
         # 每5个epoch保存一次检查点
         if (epoch + 1) % 5 == 0:
-            checkpoint_path = os.path.join(args.output_dir, args.model_name)
-            checkpoint_path = os.path.join(checkpoint_path, f'checkpoint_epoch_{epoch+1}.pth')
+            checkpoint_path = os.path.join(model_dir, f'checkpoint_epoch_{epoch+1}.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'val_acc': val_acc,
+                'val_loss': val_loss,
                 'train_acc': train_acc,
+                'train_loss': train_loss,
+                'args': vars(args),
             }, checkpoint_path)
-            print(f"  ✓ 保存检查点到: {checkpoint_path}")
+            logger.info(f"✓ Saved checkpoint to: {checkpoint_path}")
+
+        # 早停
+        if no_improve_epochs >= args.early_stop_patience:
+            logger.info(f"⚑ Early stopping: {no_improve_epochs} epochs without min_delta {args.min_delta}")
+            break
     
     # 绘制训练曲线
     plot_training_history(history)
     
     # 最终报告
-    print("\n" + "="*50)
-    print("训练完成!")
-    print(f"最佳验证准确率: {best_val_acc:.2f}%")
+    logger.info("="*50)
+    logger.info("Training finished!")
+    logger.info(f"Best val accuracy: {best_val_acc:.2f}%")
     
     return model, history
 
@@ -321,20 +369,20 @@ def plot_training_history(history):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     
     # 损失曲线
-    axes[0].plot(history['train_loss'], label='训练损失')
-    axes[0].plot(history['val_loss'], label='验证损失')
+    axes[0].plot(history['train_loss'], label='Train Loss')
+    axes[0].plot(history['val_loss'], label='Val Loss')
     axes[0].set_xlabel('Epoch')
-    axes[0].set_ylabel('损失')
-    axes[0].set_title('训练和验证损失')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training and Validation Loss')
     axes[0].legend()
     axes[0].grid(True)
     
     # 准确率曲线
-    axes[1].plot(history['train_acc'], label='训练准确率')
-    axes[1].plot(history['val_acc'], label='验证准确率')
+    axes[1].plot(history['train_acc'], label='Train Acc')
+    axes[1].plot(history['val_acc'], label='Val Acc')
     axes[1].set_xlabel('Epoch')
-    axes[1].set_ylabel('准确率')
-    axes[1].set_title('训练和验证准确率')
+    axes[1].set_ylabel('Accuracy (%)')
+    axes[1].set_title('Training and Validation Accuracy')
     axes[1].legend()
     axes[1].grid(True)
     
@@ -343,21 +391,15 @@ def plot_training_history(history):
     plt.show()
 
 if __name__ == "__main__":
-    # 设置随机种子以确保可重复性
-    torch.manual_seed(42)
-    np.random.seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-    
     print("="*60)
     print("AI生成图像检测器 - ResNet50训练框架")
     print("="*60)
     
-    # 运行主训练流程
     start_time = time.time()
     trained_model, training_history = main()
     total_time = time.time() - start_time
-    
-    print(f"\n总训练时间: {total_time/60:.1f} 分钟")
-    print("训练历史已保存到 training_history_detailed.png")
+
+    logger = logging.getLogger("train")
+    logger.info(f"Total training time: {total_time/60:.1f} minutes")
+    logger.info("Training history saved to training_history.png")
     
