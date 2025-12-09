@@ -6,8 +6,6 @@ from PIL import Image
 import torch.utils.data as data
 
 
-
-
 class Dataset(data.Dataset):
     image_size = 448
 

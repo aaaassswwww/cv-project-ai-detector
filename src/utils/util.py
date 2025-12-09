@@ -38,3 +38,23 @@ def make_worker_init_fn(base_seed: int):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     return seed_worker
+
+
+def predict(model, image, device):
+    """
+    Predict image class using the model.
+    
+    Args:
+        model: Neural network model
+        image: Input tensor (already preprocessed)
+        device: Device to run the model on (cpu or cuda)
+    
+    Returns:
+        prediction: 0 (real) or 1 (AI-generated)
+    """
+    model.eval()
+    image = image.to(device)
+    output = model(image).ravel()
+    probability = torch.sigmoid(output)
+    prediction = 1 if probability.item() > 0.5 else 0
+    return prediction

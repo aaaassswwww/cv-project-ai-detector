@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from dataset import Dataset
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
-from patch import patch_img
+from utils.patch import patch_img
 from networks.ssp import ssp
 from utils.util import set_seed, init_logger, make_worker_init_fn
 from utils.loss import build_loss

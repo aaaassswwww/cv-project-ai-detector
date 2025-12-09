@@ -11,7 +11,8 @@ from networks.ssp import ssp
 from dataset import Dataset
 from torchvision import transforms
 from torch.utils.data import DataLoader
-from patch import patch_img
+from utils.patch import patch_img
+from utils.util import predict
 from natsort import natsorted
 
 parser = argparse.ArgumentParser()
@@ -24,18 +25,6 @@ parser.add_argument('--image_size', default=256, type=int, help='image size')
 parser.add_argument('--batch_size', default=50, type=int)
 args = parser.parse_args()
 
-
-def predict(model, image, device):
-    model.eval()
-    image = image.to(device)
-    output = model(image).ravel()
-    
-    probability = torch.sigmoid(output)
-    # real_prob = 1 - probability
-    # ai_prob = probability
-    # confidence = max(real_prob, ai_prob)
-    prediction = 1 if probability.item() > 0.5 else 0
-    return prediction
 
 def save_results(image_ids, predictions, output_file):
     """

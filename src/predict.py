@@ -11,7 +11,8 @@ from networks.ssp import ssp
 from dataset import Dataset
 from torchvision import transforms
 from torch.utils.data import DataLoader
-from patch import patch_img
+from utils.patch import patch_img
+from utils.util import predict
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
@@ -35,21 +36,6 @@ def load_model(model_path, device):
 
     return model
 
-
-def predict(model, image, device):
-    model.eval()
-    class_names = [0,1]
-    image = image.to(device)
-    output = model(image).ravel()
-    
-    print(output)
-    probability = torch.sigmoid(output)
-    print(probability)
-    # real_prob = 1 - probability
-    # ai_prob = probability
-    # confidence = max(real_prob, ai_prob)
-    prediction = 1 if probability.item() > 0.5 else 0
-    return prediction
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
