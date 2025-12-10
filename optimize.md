@@ -200,6 +200,11 @@ ESSP 论文的本质贡献之一是：
 
 全局 JPEG → patch 选择 → 轻度 JPEG → resize → 模糊 → resample → ToTensor → 噪声 → 频域扰动 → Normalize。验证集使用无增强的
 
+```
+原始图像 → GlobalJPEGTransform → patch_fn → PatchTransform → (K,3,256,256)
+                                                    ├─ PIL 增强（resize, JPEG, blur, resample）
+                                                    └─ Tensor 增强（noise, freq, normalize）
+```
 ---
 训练增强:
 

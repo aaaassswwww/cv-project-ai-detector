@@ -4,6 +4,10 @@
 *.csv
 *fixes
 *fixes.*
+fixes*
+fixes*.*
+test_*
+transform*
 # Python 缓存文件
 __pycache__/
 *.py[cod]

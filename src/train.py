@@ -14,17 +14,11 @@ import matplotlib.pyplot as plt
 
 from dataset import Dataset
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
-from utils.patch import patch_img
+from utils.patch import patch_img, patch_img_deterministic
 from networks.ssp import ssp
 from utils.util import set_seed, init_logger, make_worker_init_fn
 from utils.loss import build_loss
-from utils.augment import (
-    RandomFreqPerturbation,
-    RandomGaussianBlurProb,
-    RandomGaussianNoise,
-    RandomJPEGCompression,
-    RandomResample,
-)
+from utils.transform import build_train_transform, build_val_transform
 
 
 parser = argparse.ArgumentParser()
@@ -67,80 +61,27 @@ parser.add_argument('--eta_min', default=1e-6, type=float, help='minimum lr for 
 
 args = parser.parse_args()
 
-patch_fun = transforms.Lambda(
-    lambda img: patch_img(
-        img,
-        args.patch_size,
-        256,
-        deterministic=False,
-        var_thresh=args.patch_var_thresh,
-        topk=args.patch_topk,
-    )
-    )
+# 定义 patch 提取函数
+train_patch_fn = lambda img: patch_img(
+    img,
+    args.patch_size,
+    256,
+    deterministic=False,
+    var_thresh=args.patch_var_thresh,
+    topk=args.patch_topk,
+)
 
-train_transform = transforms.Compose([
-    RandomJPEGCompression(
-        p=args.jpeg_p_global,
-        quality_range=(args.jpeg_quality_min, args.jpeg_quality_max),
-    ),
-    patch_fun,
-    RandomJPEGCompression(
-        p=args.jpeg_p_patch,
-        quality_range=(args.jpeg_quality_min, args.jpeg_quality_max),
-    ),
-    transforms.Lambda(lambda patches: patches if isinstance(patches, list) else [patches]),
-    transforms.Lambda(lambda patches: [transforms.Resize((256, 256))(p) for p in patches]),
-    transforms.Lambda(lambda patches: [
-        RandomGaussianBlurProb(
-            p=args.blur_p,
-            kernel_size=args.blur_kernel_size,
-            sigma_range=(args.blur_sigma_min, args.blur_sigma_max),
-        )(p) for p in patches
-    ]),
-    transforms.Lambda(lambda patches: [
-        RandomResample(
-            p=args.resample_p,
-            scale_range=(args.resample_scale_min, args.resample_scale_max),
-        )(p) for p in patches
-    ]),
-    transforms.Lambda(lambda patches: [transforms.ToTensor()(p) for p in patches]),
-    transforms.Lambda(lambda tensors: [
-        RandomGaussianNoise(
-            p=args.noise_p,
-            sigma_range=(args.noise_sigma_min, args.noise_sigma_max),
-        )(t) for t in tensors
-    ]),
-    transforms.Lambda(lambda tensors: [
-        RandomFreqPerturbation(
-            p=args.freq_p,
-            scale_range=(args.freq_scale_min, args.freq_scale_max),
-            radius=args.freq_radius,
-        )(t) for t in tensors
-    ]),
-    transforms.Lambda(lambda tensors: [
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(t) for t in tensors
-    ]),
-    transforms.Lambda(lambda tensors: torch.stack(tensors, dim=0)),
-])
+val_patch_fn = lambda img: patch_img_deterministic(
+    img,
+    args.patch_size,
+    256,
+    var_thresh=args.patch_var_thresh,
+    topk=args.patch_topk,
+)
 
-val_transform = transforms.Compose([
-    transforms.Lambda(
-        lambda img: patch_img_deterministic(
-            img,
-            args.patch_size,
-            256,
-            var_thresh=args.patch_var_thresh,
-            topk=args.patch_topk,
-        )
-    ),
-    transforms.Lambda(lambda patches: patches if isinstance(patches, list) else [patches]),
-    transforms.Lambda(lambda patches: [transforms.Resize((256, 256))(p) for p in patches]),
-    transforms.Lambda(lambda patches: [transforms.ToTensor()(p) for p in patches]),
-    transforms.Lambda(lambda tensors: [
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(t) for t in tensors
-    ]),
-    transforms.Lambda(lambda tensors: torch.stack(tensors, dim=0)),
-])
+# 使用自定义 Transform 类构建清晰的 pipeline
+train_transform = build_train_transform(args, train_patch_fn)
+val_transform = build_val_transform(args, val_patch_fn)
 
 def build_resnet50_model(num_classes=2):
     """构建不使用预训练权重的ResNet50模型"""
@@ -187,8 +128,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
         
         # 前向传播
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs.ravel(), labels_expanded.float())
+        outputs = model(inputs).view(-1)  # 确保输出为 (N,) 形状
+        loss = criterion(outputs, labels_expanded.float())
         
         # 反向传播
         loss.backward()
@@ -196,7 +137,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
         
         # 统计信息
         running_loss += loss.item()
-        probs = torch.sigmoid(outputs).view(-1)
+        probs = torch.sigmoid(outputs)  # outputs 已经是 (N,)
         predicted = (probs > 0.5).long()
         total += labels_expanded.size(0)
         correct += predicted.eq(labels_expanded).sum().item()
@@ -233,7 +174,7 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, to
                 unit='batch', leave=False)
     
     with torch.no_grad():
-        for inputs, labels in pbar:
+        for batch_idx, (inputs, labels) in enumerate(pbar):
             labels = labels.to(device)
             if inputs.dim() == 5:
                 b, k, c, h, w = inputs.shape
@@ -244,13 +185,13 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, to
             inputs = inputs.to(device)
             
             # 前向传播
-            outputs = model(inputs)
-            loss = criterion(outputs.ravel(), labels_expanded.float())
+            outputs = model(inputs).view(-1)  # 确保输出为 (N,) 形状
+            loss = criterion(outputs, labels_expanded.float())
             
             # 统计信息
             running_loss += loss.item()
 
-            probs = torch.sigmoid(outputs).view(-1)
+            probs = torch.sigmoid(outputs)  # outputs 已经是 (N,)
             predicted = (probs > 0.5).long()
             total += labels_expanded.size(0)
             correct += predicted.eq(labels_expanded).sum().item()
@@ -259,8 +200,8 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, to
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels_expanded.cpu().numpy())
             
-            # 更新进度条
-            avg_loss = running_loss / len(pbar)
+            # 更新进度条（修复：使用 batch_idx + 1）
+            avg_loss = running_loss / (batch_idx + 1)
             accuracy = 100. * correct / total
             pbar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
