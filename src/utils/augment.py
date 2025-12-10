@@ -21,7 +21,10 @@ class RandomJPEGCompression:
         quality = random.randint(*self.quality_range)
         img.save(buffer, format="JPEG", quality=quality)
         buffer.seek(0)
-        return Image.open(buffer).convert("RGB")
+        pil = Image.open(buffer).convert("RGB")
+        out = pil.copy()   # 把图像数据复制到内存，不再依赖 buffer
+        buffer.close()
+        return out
 
 
 class RandomGaussianBlurProb:

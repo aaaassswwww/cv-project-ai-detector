@@ -30,9 +30,12 @@ class Dataset(data.Dataset):
 
 
     def load_data(self):
+        allowed = {'.jpg','.jpeg','.png','.bmp'}
         if self.split == 'test':  # 使用 self.split 而非 self.args.split
             class_dir = self.root_images
             for filename in os.listdir(class_dir):
+                if os.path.splitext(filename)[1].lower() not in allowed:
+                    continue
                 img_path = os.path.join(class_dir, filename)
                 self.image_paths.append(img_path)
                 self.labels.append(filename)
@@ -41,6 +44,8 @@ class Dataset(data.Dataset):
                 class_dir = os.path.join(self.root_images, class_name)
 
                 for filename in os.listdir(class_dir):
+                    if os.path.splitext(filename)[1].lower() not in allowed:
+                        continue
                     img_path = os.path.join(class_dir, filename)
                     self.image_paths.append(img_path)
                     self.labels.append(label)

@@ -1,6 +1,6 @@
 import numpy as np
 import math
-from torchvision.transforms import transforms
+from torchvision import transforms
 from PIL import Image
 
 

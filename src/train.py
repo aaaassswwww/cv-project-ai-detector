@@ -437,7 +437,7 @@ def plot_training_history(history):
     
     plt.tight_layout()
     plt.savefig('training_history.png', dpi=150)
-    plt.show()
+    # plt.show()
 
 if __name__ == "__main__":
     print("="*60)
