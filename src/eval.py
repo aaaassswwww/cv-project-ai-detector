@@ -11,8 +11,8 @@ from networks.ssp import ssp
 from dataset import Dataset
 from torchvision import transforms
 from torch.utils.data import DataLoader
-from utils.patch import patch_img
-from utils.util import predict
+from utils.patch import patch_img_deterministic
+from utils.util import predict, set_seed
 from natsort import natsorted
 
 parser = argparse.ArgumentParser()
@@ -22,7 +22,8 @@ parser.add_argument('--model_name', default='ssp', type=str)
 parser.add_argument('--model_path', default="./checkpoints", help='Pretrained Model Path')
 parser.add_argument('--output_file', default="./result.csv", help='PKL for evaluation')
 parser.add_argument('--image_size', default=256, type=int, help='image size')
-parser.add_argument('--batch_size', default=50, type=int)
+parser.add_argument('--batch_size', default=64, type=int)
+parser.add_argument('--seed', default=42, type=int, help='random seed for reproducibility')
 args = parser.parse_args()
 
 
@@ -61,40 +62,79 @@ def load_model(model_path, device):
 
     return model
 
+def predict_batch(model, images, device):
+    """
+    批量预测图像类别。
+    
+    Args:
+        model: 模型
+        images: 图像 tensor (batch_size, C, H, W)
+        device: 设备
+    
+    Returns:
+        predictions: 预测结果列表
+    """
+    model.eval()
+    images = images.to(device)
+    with torch.no_grad():
+        outputs = model(images).ravel()
+        probabilities = torch.sigmoid(outputs)
+        predictions = (probabilities > 0.5).long().cpu().tolist()
+    return predictions
+
+
 def main():
+    # 设置随机种子确保可复现性
+    set_seed(args.seed)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     model = load_model(args.model_path, device)
 
+    # 使用确定性 patch 选择
     patch_fun = transforms.Lambda(
-        lambda img: patch_img(img, 32, 256)
+        lambda img: patch_img_deterministic(img, 32, 256)
         )
     test_transform = transforms.Compose([
         patch_fun,
         transforms.Resize((256,256)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet统计量
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+    
     root_images = os.path.join(args.dataset_root, args.split)
     image_paths = []
-    predictions = []
     filenames = []
-    class_dir = root_images
-    for filename in os.listdir(class_dir):
-        img_path = os.path.join(class_dir, filename)
+    
+    for filename in os.listdir(root_images):
+        img_path = os.path.join(root_images, filename)
         image_paths.append(img_path)
         filenames.append(filename)
 
-    image_paths = natsorted(image_paths)
-    filenames = natsorted(filenames)
+    # 自然排序确保顺序一致
+    sorted_pairs = natsorted(zip(filenames, image_paths), key=lambda x: x[0])
+    filenames, image_paths = zip(*sorted_pairs) if sorted_pairs else ([], [])
+    filenames = list(filenames)
+    image_paths = list(image_paths)
 
-
-    for img_path in image_paths:
-        image = Image.open(img_path).convert('RGB')
-        image = test_transform(image)
-        image = image.unsqueeze(0)
-        prediction = predict(model, image, device)
-        predictions.append(prediction)
+    # 批量推理
+    predictions = []
+    batch_size = args.batch_size
+    
+    print(f"Total images: {len(image_paths)}, Batch size: {batch_size}")
+    
+    for i in tqdm(range(0, len(image_paths), batch_size), desc="Inference"):
+        batch_paths = image_paths[i:i + batch_size]
+        batch_images = []
+        
+        for img_path in batch_paths:
+            image = Image.open(img_path).convert('RGB')
+            image = test_transform(image)
+            batch_images.append(image)
+        
+        batch_tensor = torch.stack(batch_images)
+        batch_preds = predict_batch(model, batch_tensor, device)
+        predictions.extend(batch_preds)
 
     save_results(filenames, predictions, args.output_file)
 

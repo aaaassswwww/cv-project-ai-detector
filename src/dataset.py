@@ -12,6 +12,7 @@ class Dataset(data.Dataset):
     def __init__(self, args, split, transforms):
         print('DATASET INITIALIZATION')
         self.args = args
+        self.split = split  # 保存传入的 split 参数
         root = args.dataset_root
         self.root_images = os.path.join(root, split)
         if split == "train":
@@ -29,7 +30,7 @@ class Dataset(data.Dataset):
 
 
     def load_data(self):
-        if self.args.split == 'test':
+        if self.split == 'test':  # 使用 self.split 而非 self.args.split
             class_dir = self.root_images
             for filename in os.listdir(class_dir):
                 img_path = os.path.join(class_dir, filename)
@@ -65,18 +66,25 @@ class Dataset(data.Dataset):
 
     def get_batch(self, batch_indices):
         """
-        获取一个批次的图像
+        获取一个批次的图像和标签
+        
+        Args:
+            batch_indices: 图像索引列表
+        
+        Returns:
+            images: 堆叠后的图像张量 (batch_size, C, H, W)
+            labels: 对应的标签列表
         """
         images = []
-        img_paths = []
+        labels = []
         
         for idx in batch_indices:
-            img, img_path = self.__getitem__(idx)
+            img, label = self.__getitem__(idx)
             images.append(img)
-            img_paths.append(img_path)
+            labels.append(label)
         
         # 将图像堆叠成批次
         if images:
             images = torch.stack(images)
         
-        return images, img_paths
+        return images, labels
