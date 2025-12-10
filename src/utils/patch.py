@@ -4,6 +4,11 @@ from torchvision.transforms import transforms
 from PIL import Image
 
 
+def _brightness_variance(patch: Image.Image) -> float:
+    arr = np.asarray(patch.convert('L'), dtype=np.float32)
+    return float(arr.var())
+
+
 def compute(patch):
     weight, height = patch.size
     m = weight
@@ -17,7 +22,7 @@ def compute(patch):
     return res.sum()
 
 
-def patch_img(img, patch_size, height, deterministic=False):
+def patch_img(img, patch_size, height, deterministic=False, var_thresh: float = 0.0, topk: int = 1):
     """
     从图像中选取复杂度最低的 patch。
     
@@ -53,16 +58,24 @@ def patch_img(img, patch_size, height, deterministic=False):
         rp = transforms.RandomCrop(patch_size)
         for i in range(num_patch):
             patch_list.append(rp(img))
-    
+
+    # 先按亮度方差过滤纯色/低信息 patch
+    if var_thresh > 0:
+        patch_list = [p for p in patch_list if _brightness_variance(p) >= var_thresh] or patch_list
+
+    # 按复杂度从低到高排序
     patch_list.sort(key=lambda x: compute(x), reverse=False)
-    new_img = patch_list[0]
 
-    return new_img
+    # 取 top-k 最简单 patch，至少返回 1 个
+    topk = max(1, min(topk, len(patch_list)))
+    top_patches = patch_list[:topk]
+
+    return top_patches[0] if topk == 1 else top_patches
 
 
-def patch_img_deterministic(img, patch_size, height):
+def patch_img_deterministic(img, patch_size, height, var_thresh: float = 0.0, topk: int = 1):
     """
     确定性版本的 patch_img，用于推理。
     等价于 patch_img(img, patch_size, height, deterministic=True)
     """
-    return patch_img(img, patch_size, height, deterministic=True)
+    return patch_img(img, patch_size, height, deterministic=True, var_thresh=var_thresh, topk=topk)

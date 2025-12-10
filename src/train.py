@@ -18,6 +18,13 @@ from utils.patch import patch_img
 from networks.ssp import ssp
 from utils.util import set_seed, init_logger, make_worker_init_fn
 from utils.loss import build_loss
+from utils.augment import (
+    RandomFreqPerturbation,
+    RandomGaussianBlurProb,
+    RandomGaussianNoise,
+    RandomJPEGCompression,
+    RandomResample,
+)
 
 
 parser = argparse.ArgumentParser()
@@ -27,6 +34,27 @@ parser.add_argument('--learning_rate', default=1e-4, type=float)
 parser.add_argument('--weight_decay', default=1e-4, type=float)
 parser.add_argument('--patch_size', default=32, type=int)
 parser.add_argument('--split', default='train', type=str)
+parser.add_argument('--label_smoothing', default=0.0, type=float, help='label smoothing factor in [0,1]')
+parser.add_argument('--jpeg_p_global', default=0.2, type=float, help='probability of JPEG compression before patching')
+parser.add_argument('--jpeg_p_patch', default=0.05, type=float, help='probability of JPEG compression after patching')
+parser.add_argument('--jpeg_quality_min', default=30, type=int, help='min JPEG quality for compression augment')
+parser.add_argument('--jpeg_quality_max', default=95, type=int, help='max JPEG quality for compression augment')
+parser.add_argument('--blur_p', default=0.15, type=float, help='probability of gaussian blur')
+parser.add_argument('--blur_kernel_size', default=3, type=int, help='gaussian blur kernel size (odd integer)')
+parser.add_argument('--blur_sigma_min', default=0.1, type=float, help='min gaussian sigma')
+parser.add_argument('--blur_sigma_max', default=2.0, type=float, help='max gaussian sigma')
+parser.add_argument('--resample_p', default=0.15, type=float, help='probability of downsample-upsample resample')
+parser.add_argument('--resample_scale_min', default=0.5, type=float, help='min scale factor for downsample (0,1]')
+parser.add_argument('--resample_scale_max', default=0.9, type=float, help='max scale factor for downsample (0,1]')
+parser.add_argument('--noise_p', default=0.1, type=float, help='probability of gaussian noise')
+parser.add_argument('--noise_sigma_min', default=0.005, type=float, help='min gaussian noise sigma in [0,1] space')
+parser.add_argument('--noise_sigma_max', default=0.02, type=float, help='max gaussian noise sigma in [0,1] space')
+parser.add_argument('--freq_p', default=0.1, type=float, help='probability of frequency perturbation')
+parser.add_argument('--freq_scale_min', default=0.7, type=float, help='min scale for high-frequency components')
+parser.add_argument('--freq_scale_max', default=1.3, type=float, help='max scale for high-frequency components')
+parser.add_argument('--freq_radius', default=0.25, type=float, help='radius threshold for high-frequency scaling (0-0.5]')
+parser.add_argument('--patch_var_thresh', default=0.2, type=float, help='variance threshold to drop flat patches (0 to disable)')
+parser.add_argument('--patch_topk', default=3, type=int, help='top-K simplest patches to use (>=1)')
 
 parser.add_argument('--seed', default=42, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
@@ -40,14 +68,78 @@ parser.add_argument('--eta_min', default=1e-6, type=float, help='minimum lr for 
 args = parser.parse_args()
 
 patch_fun = transforms.Lambda(
-        lambda img: patch_img(img, args.patch_size, 256)
-        )
+    lambda img: patch_img(
+        img,
+        args.patch_size,
+        256,
+        deterministic=False,
+        var_thresh=args.patch_var_thresh,
+        topk=args.patch_topk,
+    )
+    )
 
 train_transform = transforms.Compose([
+    RandomJPEGCompression(
+        p=args.jpeg_p_global,
+        quality_range=(args.jpeg_quality_min, args.jpeg_quality_max),
+    ),
     patch_fun,
-    transforms.Resize((256, 256)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet统计量
+    RandomJPEGCompression(
+        p=args.jpeg_p_patch,
+        quality_range=(args.jpeg_quality_min, args.jpeg_quality_max),
+    ),
+    transforms.Lambda(lambda patches: patches if isinstance(patches, list) else [patches]),
+    transforms.Lambda(lambda patches: [transforms.Resize((256, 256))(p) for p in patches]),
+    transforms.Lambda(lambda patches: [
+        RandomGaussianBlurProb(
+            p=args.blur_p,
+            kernel_size=args.blur_kernel_size,
+            sigma_range=(args.blur_sigma_min, args.blur_sigma_max),
+        )(p) for p in patches
+    ]),
+    transforms.Lambda(lambda patches: [
+        RandomResample(
+            p=args.resample_p,
+            scale_range=(args.resample_scale_min, args.resample_scale_max),
+        )(p) for p in patches
+    ]),
+    transforms.Lambda(lambda patches: [transforms.ToTensor()(p) for p in patches]),
+    transforms.Lambda(lambda tensors: [
+        RandomGaussianNoise(
+            p=args.noise_p,
+            sigma_range=(args.noise_sigma_min, args.noise_sigma_max),
+        )(t) for t in tensors
+    ]),
+    transforms.Lambda(lambda tensors: [
+        RandomFreqPerturbation(
+            p=args.freq_p,
+            scale_range=(args.freq_scale_min, args.freq_scale_max),
+            radius=args.freq_radius,
+        )(t) for t in tensors
+    ]),
+    transforms.Lambda(lambda tensors: [
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(t) for t in tensors
+    ]),
+    transforms.Lambda(lambda tensors: torch.stack(tensors, dim=0)),
+])
+
+val_transform = transforms.Compose([
+    transforms.Lambda(
+        lambda img: patch_img_deterministic(
+            img,
+            args.patch_size,
+            256,
+            var_thresh=args.patch_var_thresh,
+            topk=args.patch_topk,
+        )
+    ),
+    transforms.Lambda(lambda patches: patches if isinstance(patches, list) else [patches]),
+    transforms.Lambda(lambda patches: [transforms.Resize((256, 256))(p) for p in patches]),
+    transforms.Lambda(lambda patches: [transforms.ToTensor()(p) for p in patches]),
+    transforms.Lambda(lambda tensors: [
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(t) for t in tensors
+    ]),
+    transforms.Lambda(lambda tensors: torch.stack(tensors, dim=0)),
 ])
 
 def build_resnet50_model(num_classes=2):
@@ -70,7 +162,7 @@ def build_resnet50_model(num_classes=2):
     return model
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_epochs):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_epochs, topk):
     """训练一个epoch - 带tqdm进度条"""
     model.train()
     running_loss = 0.0
@@ -82,12 +174,21 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
                 unit='batch', leave=True)
     
     for batch_idx, (inputs, labels) in enumerate(pbar):
-        inputs, labels = inputs.to(device), labels.to(device)
+        # inputs shape: (B, K, C, H, W) if topk>1
+        labels = labels.to(device)
+        if inputs.dim() == 5:
+            b, k, c, h, w = inputs.shape
+            inputs = inputs.view(b * k, c, h, w)
+            labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
+        else:
+            inputs = inputs
+            labels_expanded = labels
+        inputs = inputs.to(device)
         
         # 前向传播
         optimizer.zero_grad()
         outputs = model(inputs)
-        loss = criterion(outputs.ravel(), labels.float())
+        loss = criterion(outputs.ravel(), labels_expanded.float())
         
         # 反向传播
         loss.backward()
@@ -95,10 +196,10 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
         
         # 统计信息
         running_loss += loss.item()
-        probs = torch.sigmoid(outputs).squeeze()
+        probs = torch.sigmoid(outputs).view(-1)
         predicted = (probs > 0.5).long()
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        total += labels_expanded.size(0)
+        correct += predicted.eq(labels_expanded).sum().item()
         
         # 更新进度条显示
         avg_loss = running_loss / (batch_idx + 1)
@@ -116,7 +217,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
     return epoch_loss, epoch_acc
 
 
-def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs):
+def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, topk):
     """验证一个epoch - 带tqdm进度条"""
     model.eval()
     running_loss = 0.0
@@ -133,23 +234,30 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs):
     
     with torch.no_grad():
         for inputs, labels in pbar:
-            inputs, labels = inputs.to(device), labels.to(device)
+            labels = labels.to(device)
+            if inputs.dim() == 5:
+                b, k, c, h, w = inputs.shape
+                inputs = inputs.view(b * k, c, h, w)
+                labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
+            else:
+                labels_expanded = labels
+            inputs = inputs.to(device)
             
             # 前向传播
             outputs = model(inputs)
-            loss = criterion(outputs.ravel(), labels.float())
+            loss = criterion(outputs.ravel(), labels_expanded.float())
             
             # 统计信息
             running_loss += loss.item()
 
-            probs = torch.sigmoid(outputs).squeeze()
+            probs = torch.sigmoid(outputs).view(-1)
             predicted = (probs > 0.5).long()
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            total += labels_expanded.size(0)
+            correct += predicted.eq(labels_expanded).sum().item()
             
             # 保存预测结果
             all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_labels.extend(labels_expanded.cpu().numpy())
             
             # 更新进度条
             avg_loss = running_loss / len(pbar)
@@ -193,7 +301,7 @@ def main():
     logger.info("Loading datasets...")
     train_dataset = Dataset(args=args, split='train',transforms=train_transform)
     
-    val_dataset = Dataset(args=args,split='val',transforms=train_transform)
+    val_dataset = Dataset(args=args,split='val',transforms=val_transform)
     
     generator = torch.Generator()
     generator.manual_seed(args.seed)
@@ -233,7 +341,7 @@ def main():
     model = model.to(device)
     
     # 定义损失函数和优化器
-    bce = build_loss()
+    bce = build_loss(smoothing=args.label_smoothing)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # 学习率调度器: warmup + 余弦退火
@@ -271,12 +379,12 @@ def main():
 
         # 训练
         train_loss, train_acc = train_epoch(
-            model, train_loader, bce, optimizer, device, epoch, args.num_epochs
+            model, train_loader, bce, optimizer, device, epoch, args.num_epochs, args.patch_topk
         )
         
         # 验证
         val_loss, val_acc, cm, report = validate_epoch(
-            model, val_loader, bce, device, epoch, args.num_epochs
+            model, val_loader, bce, device, epoch, args.num_epochs, args.patch_topk
         )
         
         # 更新学习率（warmup 之后再使用余弦退火）
