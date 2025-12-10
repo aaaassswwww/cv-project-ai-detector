@@ -22,5 +22,5 @@ class ssp(nn.Module):
 
 
 if __name__ == '__main__':
-    model = ssp(pretrain=True)
+    model = ssp(pretrain=False)
     print(model)

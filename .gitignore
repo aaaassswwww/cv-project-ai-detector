@@ -1,8 +1,10 @@
 /dataset
 /checkpoints
 /training_history.png
-/src/__pycache__
-/src/networks/__pycache__
-/*.csv
-
-
+*.csv
+*fixes
+*fixes.*
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class

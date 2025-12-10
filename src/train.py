@@ -53,7 +53,7 @@ parser.add_argument('--freq_p', default=0.1, type=float, help='probability of fr
 parser.add_argument('--freq_scale_min', default=0.7, type=float, help='min scale for high-frequency components')
 parser.add_argument('--freq_scale_max', default=1.3, type=float, help='max scale for high-frequency components')
 parser.add_argument('--freq_radius', default=0.25, type=float, help='radius threshold for high-frequency scaling (0-0.5]')
-parser.add_argument('--patch_var_thresh', default=0.2, type=float, help='variance threshold to drop flat patches (0 to disable)')
+parser.add_argument('--patch_var_thresh', default=5.0, type=float, help='variance threshold to drop flat patches (0 to disable)')
 parser.add_argument('--patch_topk', default=3, type=int, help='top-K simplest patches to use (>=1)')
 
 parser.add_argument('--seed', default=42, type=int, help='random seed')

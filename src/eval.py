@@ -91,15 +91,19 @@ def main():
     print(f"Using device: {device}")
     model = load_model(args.model_path, device)
 
-    # 使用确定性 patch 选择
+    # 使用确定性 patch 选择（默认 topk=1 保持兼容）
     patch_fun = transforms.Lambda(
-        lambda img: patch_img_deterministic(img, 32, 256)
+        lambda img: patch_img_deterministic(img, 32, 256, var_thresh=0.0, topk=1)
         )
     test_transform = transforms.Compose([
         patch_fun,
-        transforms.Resize((256,256)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Lambda(lambda patches: patches if isinstance(patches, list) else [patches]),
+        transforms.Lambda(lambda patches: [transforms.Resize((256, 256))(p) for p in patches]),
+        transforms.Lambda(lambda patches: [transforms.ToTensor()(p) for p in patches]),
+        transforms.Lambda(lambda tensors: [
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(t) for t in tensors
+        ]),
+        transforms.Lambda(lambda tensors: torch.stack(tensors, dim=0)),
         ])
     
     root_images = os.path.join(args.dataset_root, args.split)
@@ -129,11 +133,25 @@ def main():
         
         for img_path in batch_paths:
             image = Image.open(img_path).convert('RGB')
-            image = test_transform(image)
+            image = test_transform(image)  # shape: (K, C, H, W)
             batch_images.append(image)
         
-        batch_tensor = torch.stack(batch_images)
-        batch_preds = predict_batch(model, batch_tensor, device)
+        # batch_images: list of (K, C, H, W) tensors
+        batch_tensor = torch.stack(batch_images)  # (B, K, C, H, W)
+        
+        # 如果 K > 1，需要展平成 (B*K, C, H, W) 推理后再投票
+        if batch_tensor.dim() == 5:
+            b, k, c, h, w = batch_tensor.shape
+            batch_tensor_flat = batch_tensor.view(b * k, c, h, w)
+            batch_preds_raw = predict_batch(model, batch_tensor_flat, device)  # (B*K,)
+            # 对每张图像的 K 个 patch 投票（取平均）
+            batch_preds = []
+            for j in range(b):
+                votes = batch_preds_raw[j*k:(j+1)*k]
+                batch_preds.append(int(sum(votes) / k >= 0.5))  # 平均投票
+        else:
+            batch_preds = predict_batch(model, batch_tensor, device)
+        
         predictions.extend(batch_preds)
 
     save_results(filenames, predictions, args.output_file)
