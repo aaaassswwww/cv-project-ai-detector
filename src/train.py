@@ -128,7 +128,13 @@ def build_resnet50_model(num_classes=2):
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_epochs, topk, use_global_local=False):
-    """训练一个epoch - 带tqdm进度条"""
+    """训练一个epoch - 带tqdm进度条
+    
+    注意：训练时使用 Patch-level loss 和准确率
+    - 每个 patch 独立计算 loss，增加有效 batch size
+    - 训练指标是 patch-level，仅供参考
+    - 真实性能以验证集的 Image-level 准确率为准
+    """
     model.train()
     running_loss = 0.0
     correct = 0
@@ -202,13 +208,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
 
 
 def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, topk, use_global_local=False):
-    """验证一个epoch - 带tqdm进度条"""
+    """验证一个epoch - 带tqdm进度条
+    
+    重要：计算 Image-level 准确率（非 Patch-level）
+    - 对每张图的 K 个 patch 预测结果进行软投票（平均概率）
+    - 与原始图像标签对比，计算真实的准确率
+    """
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
     
-    # 用于存储所有预测和标签以计算详细指标
+    # 用于存储所有预测和标签以计算详细指标（Image-level）
     all_preds = []
     all_labels = []
     
@@ -218,49 +229,69 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, to
     
     with torch.no_grad():
         for batch_idx, (inputs, labels) in enumerate(pbar):
-            labels = labels.to(device)
+            labels = labels.to(device)  # (B,)
+            batch_size = labels.size(0)
             
             # 处理 global_local 模型的字典输入
             if use_global_local:
                 # inputs 是字典
-                inputs_local = inputs['local']
-                inputs_global = inputs['global'].to(device)
+                inputs_local = inputs['local']  # (B, K, 3, 256, 256)
+                inputs_global = inputs['global'].to(device)  # (B, 3, H, W)
                 
                 # 展平 local patches
                 b, k, c, h, w = inputs_local.shape
-                inputs_local = inputs_local.view(b * k, c, h, w).to(device)
+                inputs_local = inputs_local.view(b * k, c, h, w).to(device)  # (B*K, 3, 256, 256)
                 
-                # 扩展标签
-                labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
+                # 扩展标签用于 loss 计算（patch-level loss）
+                labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)  # (B*K,)
                 
                 # 前向传播
-                outputs = model(inputs_local, inputs_global).view(-1)
-                loss = criterion(outputs, labels_expanded.float())
+                outputs = model(inputs_local, inputs_global)  # (B*K, 1)
+                loss = criterion(outputs.view(-1), labels_expanded.float())
+                
+                # ===== Image-level 准确率计算 =====
+                # 重塑为 (B, K, 1)
+                outputs_per_image = outputs.view(b, k, 1)  # (B, K, 1)
+                probs_per_image = torch.sigmoid(outputs_per_image)  # (B, K, 1)
+                
+                # 软投票：对每张图的 K 个 patch 概率求平均
+                avg_probs = probs_per_image.mean(dim=1).squeeze()  # (B,)
+                predicted = (avg_probs > 0.5).long()  # (B,)
+                
             else:
                 # 原有逻辑
-                if inputs.dim() == 5:
+                if inputs.dim() == 5:  # (B, K, C, H, W)
                     b, k, c, h, w = inputs.shape
-                    inputs = inputs.view(b * k, c, h, w)
-                    labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
-                else:
-                    labels_expanded = labels
-                inputs = inputs.to(device)
-                
-                # 前向传播
-                outputs = model(inputs).view(-1)  # 确保输出为 (N,) 形状
-                loss = criterion(outputs, labels_expanded.float())
+                    inputs = inputs.view(b * k, c, h, w).to(device)  # (B*K, C, H, W)
+                    labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)  # (B*K,)
+                    
+                    # 前向传播
+                    outputs = model(inputs)  # (B*K, 1)
+                    loss = criterion(outputs.view(-1), labels_expanded.float())
+                    
+                    # ===== Image-level 准确率计算 =====
+                    outputs_per_image = outputs.view(b, k, 1)  # (B, K, 1)
+                    probs_per_image = torch.sigmoid(outputs_per_image)  # (B, K, 1)
+                    avg_probs = probs_per_image.mean(dim=1).squeeze()  # (B,)
+                    predicted = (avg_probs > 0.5).long()  # (B,)
+                    
+                else:  # (B, C, H, W) - topk=1
+                    inputs = inputs.to(device)
+                    outputs = model(inputs).view(-1)  # (B,)
+                    loss = criterion(outputs, labels.float())
+                    
+                    # Image-level（单 patch 情况）
+                    probs = torch.sigmoid(outputs)  # (B,)
+                    predicted = (probs > 0.5).long()  # (B,)
             
-            # 统计信息
+            # 统计信息（Image-level）
             running_loss += loss.item()
-
-            probs = torch.sigmoid(outputs)  # outputs 已经是 (N,)
-            predicted = (probs > 0.5).long()
-            total += labels_expanded.size(0)
-            correct += predicted.eq(labels_expanded).sum().item()
+            total += batch_size  # 注意：这里是图像数量，不是 patch 数量
+            correct += predicted.eq(labels).sum().item()
             
-            # 保存预测结果
+            # 保存预测结果（Image-level）
             all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels_expanded.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
             
             # 更新进度条（修复：使用 batch_idx + 1）
             avg_loss = running_loss / (batch_idx + 1)
