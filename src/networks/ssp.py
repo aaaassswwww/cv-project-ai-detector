@@ -76,17 +76,18 @@ class ssp(nn.Module):
             resnet_in_channels = 64
         elif fusion_mode == 'dual_stream':
             # 双流模式：SRM 和 RGB 分别通过 conv 后 concat
+            # 添加 LayerNorm 确保两个分支的输出尺度一致
             self.srm_stream = nn.Sequential(
                 nn.Conv2d(self.srm_out_channels, 32, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(32),
+                nn.GroupNorm(4, 32),  # 使用 GroupNorm 而非 BN，更稳定
                 nn.ReLU(inplace=True),
             )
             self.rgb_stream = nn.Sequential(
                 nn.Conv2d(3, 32, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(32),
+                nn.GroupNorm(4, 32),
                 nn.ReLU(inplace=True),
             )
-            print(f"✓ Using dual_stream fusion mode: SRM stream + RGB stream -> concat(64)")
+            print(f"✓ Using dual_stream fusion mode: SRM stream + RGB stream -> concat(64) with GroupNorm")
             resnet_in_channels = 64
         else:  # replace
             print(f"✓ Using replace fusion mode: SRM only -> ResNet")
@@ -123,8 +124,11 @@ class ssp(nn.Module):
         输出:
             logits: (B*K, 1) 或 (B, 1)
         """
-        # 统一尺寸到 256x256
-        x_resized = F.interpolate(x, (256, 256), mode='bilinear')
+        # 只在必要时才进行插值，避免破坏高频噪声结构
+        if x.shape[-1] != 256 or x.shape[-2] != 256:
+            x_resized = F.interpolate(x, (256, 256), mode='bilinear', align_corners=False)
+        else:
+            x_resized = x
         
         # 高频滤波
         srm_features = self.srm(x_resized)

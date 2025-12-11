@@ -215,5 +215,11 @@ label smoothing
 网络结构增强:
 
 可学习的 SRM / 高通 / 高频增强层
+对单个patch使用 SRM 和 RGB 两个流
 
 轻量 Global–Local 双流结构（Global–Local two-stream）
+---
+测试时增强 TTA
+
+FDA (Fourier Domain Adaptation) 数据增强
+

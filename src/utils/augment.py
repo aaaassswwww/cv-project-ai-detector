@@ -98,9 +98,11 @@ class RandomFreqPerturbation:
         radius_map = torch.sqrt(grid_x**2 + grid_y**2)
 
         scale = random.uniform(*self.scale_range)
-        # 使用 freq 的 dtype (complex) 而非 tensor 的 dtype (float)
-        mask = torch.ones((h, w), device=device, dtype=freq.dtype)
-        mask = mask + (radius_map >= self.radius) * (scale - 1.0)
+        # 使用 float dtype 避免 bool 转 complex 的问题
+        mask = torch.ones((h, w), device=device, dtype=torch.float32)
+        # 明确将 bool mask 转换为 float
+        high_freq_mask = (radius_map >= self.radius).to(torch.float32)
+        mask = mask + high_freq_mask * (scale - 1.0)
         mask = mask.unsqueeze(0)
 
         freq = freq * mask

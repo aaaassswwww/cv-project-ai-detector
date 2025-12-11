@@ -88,13 +88,13 @@ class PatchTransform:
                 radius=self.config['freq_radius'],
             )
         
-        # 标准化操作
+        # 基础操作（不使用 ImageNet normalize，forensics 任务不需要）
         self.resize = transforms.Resize((patch_size, patch_size))
-        self.to_tensor = transforms.ToTensor()
-        self.normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
+        self.to_tensor = transforms.ToTensor()  # 转为 [0,1] 范围
+        # 注意：不使用 normalize，因为：
+        # 1. normalize 会放大噪声增强的影响 (noise/0.22 ≈ 4.5x)
+        # 2. SRM 高频特征不应被 normalize 扭曲
+        # 3. Forensics 任务通常不需要 ImageNet 统计量
     
     def _ensure_list(self, patches: Union[Image.Image, List[Image.Image]]) -> List[Image.Image]:
         """确保输入为列表格式"""
@@ -105,7 +105,9 @@ class PatchTransform:
     
     def _apply_pil_transform(self, patch: Image.Image) -> Image.Image:
         """对单个 PIL Image 应用 PIL 级别的增强"""
-        patch = self.resize(patch)
+        # 问题7修复：只在patch尺寸不匹配时才resize，避免双重resize
+        if patch.size != (self.patch_size, self.patch_size):
+            patch = self.resize(patch)
         
         if self.apply_augment:
             # 应用 JPEG 压缩增强（在 patch 之后）
@@ -120,14 +122,12 @@ class PatchTransform:
     def _apply_tensor_transform(self, tensor: torch.Tensor) -> torch.Tensor:
         """对单个 Tensor 应用 Tensor 级别的增强"""
         if self.apply_augment:
-            # 应用高斯噪声
+            # 应用高斯噪声（在 [0,1] 范围内）
             tensor = self.noise_aug(tensor)
-            # 应用频率扰动
+            # 应用频率扰动（在 [0,1] 范围内）
             tensor = self.freq_aug(tensor)
         
-        # 标准化
-        tensor = self.normalize(tensor)
-        
+        # 不再使用 normalize，保持 [0,1] 范围，避免破坏 SRM 特征
         return tensor
     
     def __call__(self, patches: Union[Image.Image, List[Image.Image]]) -> torch.Tensor:
