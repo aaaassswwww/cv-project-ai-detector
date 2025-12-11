@@ -50,6 +50,14 @@ parser.add_argument('--freq_radius', default=0.25, type=float, help='radius thre
 parser.add_argument('--patch_var_thresh', default=5.0, type=float, help='variance threshold to drop flat patches (0 to disable)')
 parser.add_argument('--patch_topk', default=3, type=int, help='top-K simplest patches to use (>=1)')
 
+# Learnable SRM 相关参数
+parser.add_argument('--use_learnable_srm', action='store_true', help='use learnable SRM instead of classic SRMConv2d')
+parser.add_argument('--srm_out_channels', default=12, type=int, help='output channels for learnable SRM (default 12)')
+parser.add_argument('--srm_kernel_size', default=5, type=int, help='kernel size for learnable SRM (3 or 5)')
+parser.add_argument('--srm_block_type', default='srm_only', type=str, help='SRM block type: srm_only, srm_bn, srm_bn_relu, srm_bn_leaky')
+parser.add_argument('--srm_freeze_epochs', default=0, type=int, help='freeze learnable SRM for N epochs (0 to not freeze)')
+parser.add_argument('--srm_lr_scale', default=1.0, type=float, help='learning rate scale for SRM (e.g., 0.1 for 10%% of base lr)')
+
 parser.add_argument('--seed', default=42, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
 parser.add_argument('--output_dir', default='checkpoints', type=str, help='output directory')
@@ -277,13 +285,36 @@ def main():
     # 构建模型
     logger.info("="*50)
     logger.info("Building model...")
-    # model = build_resnet50_model(num_classes=2)
-    model = ssp()
+    
+    # 构建 learnable SRM 配置
+    learnable_srm_config = None
+    if args.use_learnable_srm:
+        learnable_srm_config = {
+            'out_channels': args.srm_out_channels,
+            'kernel_size': args.srm_kernel_size,
+            'block_type': args.srm_block_type,
+            'freeze_init_epochs': args.srm_freeze_epochs,
+        }
+        logger.info(f"  - Using Learnable SRM with config: {learnable_srm_config}")
+    else:
+        logger.info("  - Using classic SRMConv2d")
+    
+    model = ssp(
+        pretrain=True,
+        topk=args.patch_topk,
+        use_learnable_srm=args.use_learnable_srm,
+        learnable_srm_config=learnable_srm_config,
+    )
     model = model.to(device)
     
     # 定义损失函数和优化器
     bce = build_loss(smoothing=args.label_smoothing)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    
+    # 如果使用可学习 SRM 且设定了特定学习率，进行调整
+    if args.use_learnable_srm and args.srm_lr_scale != 1.0:
+        model.set_srm_learning_rate(optimizer, args.srm_lr_scale)
+        logger.info(f"  - SRM learning rate scale: {args.srm_lr_scale}")
     
     # 学习率调度器: warmup + 余弦退火
     cosine_t_max = max(1, args.num_epochs - args.warmup_epochs)
@@ -297,9 +328,6 @@ def main():
         'val_loss': [], 'val_acc': [],
         'learning_rate': []
     }
-    
-    # 训练循环
-    logger.info("="*50)
     logger.info("Start training...")
     best_val_acc = 0.0
     best_val_loss = float('inf')
@@ -311,12 +339,25 @@ def main():
     for epoch in epoch_pbar:
         epoch_start_time = time.time()
         
+        # SRM freeze/unfreeze 管理
+        if args.use_learnable_srm and args.srm_freeze_epochs > 0:
+            if epoch < args.srm_freeze_epochs:
+                model.freeze_srm()
+                srm_status = "FROZEN"
+            else:
+                if epoch == args.srm_freeze_epochs:  # 解冻的第一个 epoch
+                    model.unfreeze_srm()
+                    logger.info(f"⚡ Unfroze SRM at epoch {epoch+1}")
+                srm_status = "TRAINABLE"
+        else:
+            srm_status = "N/A" if not args.use_learnable_srm else "TRAINABLE"
+        
         # Warmup: 线性提升到基础学习率
         if epoch < args.warmup_epochs:
             warmup_lr = args.learning_rate * (epoch + 1) / max(1, args.warmup_epochs)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = warmup_lr
-            logger.info(f"Warmup epoch {epoch+1}/{args.warmup_epochs} | LR {warmup_lr:.6f}")
+            logger.info(f"Warmup epoch {epoch+1}/{args.warmup_epochs} | LR {warmup_lr:.6f} | SRM: {srm_status}")
 
         # 训练
         train_loss, train_acc = train_epoch(

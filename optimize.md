@@ -196,6 +196,8 @@ ESSP 论文的本质贡献之一是：
 
 
 ---
+label smoothing
+
 训练数据增强:
 
 全局 JPEG → patch 选择 → 轻度 JPEG → resize → 模糊 → resample → ToTensor → 噪声 → 频域扰动 → Normalize。验证集使用无增强的
@@ -209,3 +211,9 @@ ESSP 论文的本质贡献之一是：
 训练增强:
 
 死区过滤(计算亮度方差，屏蔽纯色区域) + Top-K 简单 patch 投票
+---
+网络结构增强:
+
+可学习的 SRM / 高通 / 高频增强层
+
+轻量 Global–Local 双流结构（Global–Local two-stream）
