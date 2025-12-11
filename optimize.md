@@ -221,5 +221,5 @@ label smoothing
 ---
 测试时增强 TTA
 
-FDA (Fourier Domain Adaptation) 数据增强
+FDA (Fourier Domain Adaptation) 数据增强（暂定，还未实现）
 

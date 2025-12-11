@@ -62,6 +62,12 @@ parser.add_argument('--srm_use_mixing', action='store_true', help='use 1x1 conv 
 parser.add_argument('--srm_seed', default=42, type=int, help='random seed for SRM kernel perturbation (use different values for ensemble)')
 parser.add_argument('--fusion_mode', default='replace', type=str, choices=['replace', 'concat', 'dual_stream'], help='fusion mode: replace (SRM only), concat (SRM+RGB), dual_stream (SRM stream + RGB stream)')
 
+# Global-Local Dual Stream 相关参数
+parser.add_argument('--use_global_local', action='store_true', help='use Global-Local Dual Stream architecture')
+parser.add_argument('--global_size', default=384, type=int, help='global stream input size (320, 384, or 512)')
+parser.add_argument('--share_backbone', action='store_true', help='share ResNet backbone between local and global streams (lightweight mode)')
+parser.add_argument('--feature_fusion_type', default='concat', type=str, choices=['concat', 'add', 'attention'], help='feature fusion type: concat, add (weighted), attention')
+
 parser.add_argument('--seed', default=42, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
 parser.add_argument('--output_dir', default='checkpoints', type=str, help='output directory')
@@ -92,8 +98,14 @@ val_patch_fn = lambda img: patch_img_deterministic(
 )
 
 # 使用自定义 Transform 类构建清晰的 pipeline
-train_transform = build_train_transform(args, train_patch_fn)
-val_transform = build_val_transform(args, val_patch_fn)
+# 如果使用 global_local，需要特殊的 transform 同时返回全局图和 patch
+if hasattr(args, 'use_global_local') and args.use_global_local:
+    from utils.transform import build_dual_stream_train_transform, build_dual_stream_val_transform
+    train_transform = build_dual_stream_train_transform(args, train_patch_fn)
+    val_transform = build_dual_stream_val_transform(args, val_patch_fn)
+else:
+    train_transform = build_train_transform(args, train_patch_fn)
+    val_transform = build_val_transform(args, val_patch_fn)
 
 def build_resnet50_model(num_classes=2):
     """构建不使用预训练权重的ResNet50模型"""
@@ -115,7 +127,7 @@ def build_resnet50_model(num_classes=2):
     return model
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_epochs, topk):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_epochs, topk, use_global_local=False):
     """训练一个epoch - 带tqdm进度条"""
     model.train()
     running_loss = 0.0
@@ -127,21 +139,40 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
                 unit='batch', leave=True)
     
     for batch_idx, (inputs, labels) in enumerate(pbar):
-        # inputs shape: (B, K, C, H, W) if topk>1
         labels = labels.to(device)
-        if inputs.dim() == 5:
-            b, k, c, h, w = inputs.shape
-            inputs = inputs.view(b * k, c, h, w)
-            labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
-        else:
-            inputs = inputs
-            labels_expanded = labels
-        inputs = inputs.to(device)
         
-        # 前向传播
-        optimizer.zero_grad()
-        outputs = model(inputs).view(-1)  # 确保输出为 (N,) 形状
-        loss = criterion(outputs, labels_expanded.float())
+        # 处理 global_local 模型的字典输入
+        if use_global_local:
+            # inputs 是字典 {'local': (B, K, 3, 256, 256), 'global': (B, 3, H, W)}
+            inputs_local = inputs['local']  # (B, K, 3, 256, 256)
+            inputs_global = inputs['global'].to(device)  # (B, 3, global_size, global_size)
+            
+            # 展平 local patches
+            b, k, c, h, w = inputs_local.shape
+            inputs_local = inputs_local.view(b * k, c, h, w).to(device)  # (B*K, 3, 256, 256)
+            
+            # 扩展标签
+            labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)  # (B*K,)
+            
+            # 前向传播（传入两个参数）
+            optimizer.zero_grad()
+            outputs = model(inputs_local, inputs_global).view(-1)  # (B*K,)
+            loss = criterion(outputs, labels_expanded.float())
+        else:
+            # 原有的单流模型逻辑
+            if inputs.dim() == 5:
+                b, k, c, h, w = inputs.shape
+                inputs = inputs.view(b * k, c, h, w)
+                labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
+            else:
+                inputs = inputs
+                labels_expanded = labels
+            inputs = inputs.to(device)
+            
+            # 前向传播
+            optimizer.zero_grad()
+            outputs = model(inputs).view(-1)  # 确保输出为 (N,) 形状
+            loss = criterion(outputs, labels_expanded.float())
         
         # 反向传播
         loss.backward()
@@ -170,7 +201,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, total_ep
     return epoch_loss, epoch_acc
 
 
-def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, topk):
+def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, topk, use_global_local=False):
     """验证一个epoch - 带tqdm进度条"""
     model.eval()
     running_loss = 0.0
@@ -188,17 +219,36 @@ def validate_epoch(model, dataloader, criterion, device, epoch, total_epochs, to
     with torch.no_grad():
         for batch_idx, (inputs, labels) in enumerate(pbar):
             labels = labels.to(device)
-            if inputs.dim() == 5:
-                b, k, c, h, w = inputs.shape
-                inputs = inputs.view(b * k, c, h, w)
-                labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
-            else:
-                labels_expanded = labels
-            inputs = inputs.to(device)
             
-            # 前向传播
-            outputs = model(inputs).view(-1)  # 确保输出为 (N,) 形状
-            loss = criterion(outputs, labels_expanded.float())
+            # 处理 global_local 模型的字典输入
+            if use_global_local:
+                # inputs 是字典
+                inputs_local = inputs['local']
+                inputs_global = inputs['global'].to(device)
+                
+                # 展平 local patches
+                b, k, c, h, w = inputs_local.shape
+                inputs_local = inputs_local.view(b * k, c, h, w).to(device)
+                
+                # 扩展标签
+                labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
+                
+                # 前向传播
+                outputs = model(inputs_local, inputs_global).view(-1)
+                loss = criterion(outputs, labels_expanded.float())
+            else:
+                # 原有逻辑
+                if inputs.dim() == 5:
+                    b, k, c, h, w = inputs.shape
+                    inputs = inputs.view(b * k, c, h, w)
+                    labels_expanded = labels.view(-1, 1).repeat(1, k).view(-1)
+                else:
+                    labels_expanded = labels
+                inputs = inputs.to(device)
+                
+                # 前向传播
+                outputs = model(inputs).view(-1)  # 确保输出为 (N,) 形状
+                loss = criterion(outputs, labels_expanded.float())
             
             # 统计信息
             running_loss += loss.item()
@@ -308,13 +358,34 @@ def main():
         logger.info("  - Using classic SRMConv2d")
         logger.info(f"  - Fusion mode: {args.fusion_mode}")
     
-    model = ssp(
-        pretrain=True,
-        topk=args.patch_topk,
-        use_learnable_srm=args.use_learnable_srm,
-        learnable_srm_config=learnable_srm_config,
-        fusion_mode=args.fusion_mode,
-    )
+    # 选择模型架构
+    if args.use_global_local:
+        from networks.global_local import GlobalLocalDualStream
+        logger.info("  - Using Global-Local Dual Stream architecture")
+        logger.info(f"    * Global size: {args.global_size}x{args.global_size}")
+        logger.info(f"    * Share backbone: {args.share_backbone}")
+        logger.info(f"    * Feature fusion: {args.feature_fusion_type}")
+        
+        model = GlobalLocalDualStream(
+            pretrain=True,
+            topk=args.patch_topk,
+            use_learnable_srm=args.use_learnable_srm,
+            learnable_srm_config=learnable_srm_config,
+            fusion_mode=args.fusion_mode,
+            global_size=args.global_size,
+            share_backbone=args.share_backbone,
+            fusion_type=args.feature_fusion_type,
+        )
+    else:
+        logger.info("  - Using Single-Stream SSP architecture")
+        model = ssp(
+            pretrain=True,
+            topk=args.patch_topk,
+            use_learnable_srm=args.use_learnable_srm,
+            learnable_srm_config=learnable_srm_config,
+            fusion_mode=args.fusion_mode,
+        )
+    
     model = model.to(device)
     
     # 定义损失函数和优化器
@@ -376,12 +447,14 @@ def main():
 
         # 训练
         train_loss, train_acc = train_epoch(
-            model, train_loader, bce, optimizer, device, epoch, args.num_epochs, args.patch_topk
+            model, train_loader, bce, optimizer, device, epoch, args.num_epochs, args.patch_topk,
+            use_global_local=args.use_global_local if hasattr(args, 'use_global_local') else False
         )
         
         # 验证
         val_loss, val_acc, cm, report = validate_epoch(
-            model, val_loader, bce, device, epoch, args.num_epochs, args.patch_topk
+            model, val_loader, bce, device, epoch, args.num_epochs, args.patch_topk,
+            use_global_local=args.use_global_local if hasattr(args, 'use_global_local') else False
         )
         
         # 更新学习率（warmup 之后再使用余弦退火）

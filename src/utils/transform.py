@@ -249,3 +249,150 @@ def build_val_transform(args, patch_fn: Callable) -> transforms.Compose:
             augment_config=None,
         ),
     ])
+
+
+class DualStreamTransform:
+    """
+    Global-Local Dual Stream 专用 Transform
+    
+    同时输出：
+    1. Global: 完整的原图（resize 到固定尺寸）
+    2. Local: 提取的 patch（经过增强处理）
+    
+    这样 Global Stream 才能真正看到全局布局和语义信息
+    """
+    
+    def __init__(
+        self,
+        global_size: int,
+        patch_fn: Callable,
+        patch_size: int = 256,
+        apply_augment: bool = True,
+        augment_config: Optional[dict] = None,
+        apply_global_jpeg: bool = True,
+        jpeg_p: float = 0.2,
+        jpeg_quality_range: tuple = (30, 95),
+    ):
+        """
+        参数：
+            global_size: 全局图的目标尺寸（例如 384）
+            patch_fn: patch 提取函数
+            patch_size: patch 的目标尺寸（例如 256）
+            apply_augment: 是否对 patch 应用增强
+            augment_config: patch 增强配置
+            apply_global_jpeg: 是否在提取 patch 前对原图应用 JPEG 压缩
+            jpeg_p: JPEG 压缩概率
+            jpeg_quality_range: JPEG 质量范围
+        """
+        self.global_size = global_size
+        self.patch_fn = patch_fn
+        self.apply_global_jpeg = apply_global_jpeg
+        
+        # 全局 JPEG 增强（可选）
+        if apply_global_jpeg:
+            self.global_jpeg = RandomJPEGCompression(p=jpeg_p, quality_range=jpeg_quality_range)
+        
+        # 全局图处理：Resize + ToTensor
+        # 注意：保持 [0,1] 范围，不使用 ImageNet normalize
+        self.global_transform = transforms.Compose([
+            transforms.Resize((global_size, global_size)),
+            transforms.ToTensor(),
+        ])
+        
+        # Local patch 处理
+        self.patch_transform = PatchTransform(
+            patch_size=patch_size,
+            apply_augment=apply_augment,
+            augment_config=augment_config,
+        )
+    
+    def __call__(self, img: Image.Image) -> dict:
+        """
+        输入：PIL Image（原始图像）
+        输出：字典 {'global': Tensor(C,H,W), 'local': Tensor(K,C,H,W)}
+        """
+        # 1. 可选的全局 JPEG 压缩（在分流前应用）
+        if self.apply_global_jpeg:
+            img = self.global_jpeg(img)
+        
+        # 2. Global Stream: 处理完整图像
+        x_global = self.global_transform(img)  # (3, global_size, global_size)
+        
+        # 3. Local Stream: 提取 patch 并处理
+        patches = self.patch_fn(img)  # 返回 PIL Image 或 list of PIL Images
+        x_local = self.patch_transform(patches)  # (K, 3, 256, 256)
+        
+        return {
+            'global': x_global,
+            'local': x_local,
+        }
+    
+    def __repr__(self):
+        return (f"DualStreamTransform(\n"
+                f"  global_size={self.global_size},\n"
+                f"  patch_transform={self.patch_transform}\n"
+                f")")
+
+
+def build_dual_stream_train_transform(args, patch_fn: Callable) -> DualStreamTransform:
+    """
+    构建 Global-Local Dual Stream 训练的 Transform
+    
+    参数：
+        args: 命令行参数对象（需要包含 global_size）
+        patch_fn: patch 提取函数
+    
+    返回：
+        DualStreamTransform 对象
+    """
+    augment_config = {
+        'jpeg_p_patch': args.jpeg_p_patch,
+        'jpeg_quality_min': args.jpeg_quality_min,
+        'jpeg_quality_max': args.jpeg_quality_max,
+        'blur_p': args.blur_p,
+        'blur_kernel_size': args.blur_kernel_size,
+        'blur_sigma_min': args.blur_sigma_min,
+        'blur_sigma_max': args.blur_sigma_max,
+        'resample_p': args.resample_p,
+        'resample_scale_min': args.resample_scale_min,
+        'resample_scale_max': args.resample_scale_max,
+        'noise_p': args.noise_p,
+        'noise_sigma_min': args.noise_sigma_min,
+        'noise_sigma_max': args.noise_sigma_max,
+        'freq_p': args.freq_p,
+        'freq_scale_min': args.freq_scale_min,
+        'freq_scale_max': args.freq_scale_max,
+        'freq_radius': args.freq_radius,
+    }
+    
+    return DualStreamTransform(
+        global_size=getattr(args, 'global_size', 384),  # 默认 384
+        patch_fn=patch_fn,
+        patch_size=256,
+        apply_augment=True,
+        augment_config=augment_config,
+        apply_global_jpeg=True,
+        jpeg_p=args.jpeg_p_global,
+        jpeg_quality_range=(args.jpeg_quality_min, args.jpeg_quality_max),
+    )
+
+
+def build_dual_stream_val_transform(args, patch_fn: Callable) -> DualStreamTransform:
+    """
+    构建 Global-Local Dual Stream 验证/测试的 Transform
+    
+    参数：
+        args: 命令行参数对象
+        patch_fn: patch 提取函数（deterministic 模式）
+    
+    返回：
+        DualStreamTransform 对象
+    """
+    return DualStreamTransform(
+        global_size=getattr(args, 'global_size', 384),
+        patch_fn=patch_fn,
+        patch_size=256,
+        apply_augment=False,  # 验证时不增强
+        augment_config=None,
+        apply_global_jpeg=False,  # 验证时不压缩
+    )
