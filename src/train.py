@@ -57,6 +57,10 @@ parser.add_argument('--srm_kernel_size', default=5, type=int, help='kernel size 
 parser.add_argument('--srm_block_type', default='srm_only', type=str, help='SRM block type: srm_only, srm_bn, srm_bn_relu, srm_bn_leaky')
 parser.add_argument('--srm_freeze_epochs', default=0, type=int, help='freeze learnable SRM for N epochs (0 to not freeze)')
 parser.add_argument('--srm_lr_scale', default=1.0, type=float, help='learning rate scale for SRM (e.g., 0.1 for 10%% of base lr)')
+parser.add_argument('--srm_use_norm', action='store_true', help='use GroupNorm after SRM for output stabilization (recommended)')
+parser.add_argument('--srm_use_mixing', action='store_true', help='use 1x1 conv for channel mixing (learnable kernel fusion)')
+parser.add_argument('--srm_seed', default=42, type=int, help='random seed for SRM kernel perturbation (use different values for ensemble)')
+parser.add_argument('--fusion_mode', default='replace', type=str, choices=['replace', 'concat', 'dual_stream'], help='fusion mode: replace (SRM only), concat (SRM+RGB), dual_stream (SRM stream + RGB stream)')
 
 parser.add_argument('--seed', default=42, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
@@ -294,27 +298,38 @@ def main():
             'kernel_size': args.srm_kernel_size,
             'block_type': args.srm_block_type,
             'freeze_init_epochs': args.srm_freeze_epochs,
+            'use_norm': args.srm_use_norm,
+            'use_mixing': args.srm_use_mixing,
+            'seed': args.srm_seed,
         }
         logger.info(f"  - Using Learnable SRM with config: {learnable_srm_config}")
+        logger.info(f"  - Fusion mode: {args.fusion_mode}")
     else:
         logger.info("  - Using classic SRMConv2d")
+        logger.info(f"  - Fusion mode: {args.fusion_mode}")
     
     model = ssp(
         pretrain=True,
         topk=args.patch_topk,
         use_learnable_srm=args.use_learnable_srm,
         learnable_srm_config=learnable_srm_config,
+        fusion_mode=args.fusion_mode,
     )
     model = model.to(device)
     
     # 定义损失函数和优化器
     bce = build_loss(smoothing=args.label_smoothing)
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
-    # 如果使用可学习 SRM 且设定了特定学习率，进行调整
+    # 使用分离的参数组创建 optimizer（更稳健的方式）
+    param_groups = model.get_param_groups(
+        base_lr=args.learning_rate,
+        srm_lr_scale=args.srm_lr_scale,
+        weight_decay=args.weight_decay
+    )
+    optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
+    
     if args.use_learnable_srm and args.srm_lr_scale != 1.0:
-        model.set_srm_learning_rate(optimizer, args.srm_lr_scale)
-        logger.info(f"  - SRM learning rate scale: {args.srm_lr_scale}")
+        logger.info(f"  - SRM learning rate scale: {args.srm_lr_scale}x (lr={args.learning_rate * args.srm_lr_scale:.6e})")
     
     # 学习率调度器: warmup + 余弦退火
     cosine_t_max = max(1, args.num_epochs - args.warmup_epochs)

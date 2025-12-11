@@ -215,5 +215,5 @@ def resnet152(pretrained=False, **kwargs):
 
 
 if __name__ == '__main__':
-    net = resnet50(pretrained=True)
+    net = resnet50(pretrained=False)
     print(net)

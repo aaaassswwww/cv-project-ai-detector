@@ -98,13 +98,14 @@ SRM_KERNELS_5x5 = np.array([
 ], dtype=np.float32)
 
 
-def create_srm_kernels(kernel_size: int = 5, num_kernels: int = 12) -> torch.Tensor:
+def create_srm_kernels(kernel_size: int = 5, num_kernels: int = 12, seed: Optional[int] = 42) -> torch.Tensor:
     """
     创建 SRM kernel 张量
     
     参数：
         kernel_size: 3 或 5
         num_kernels: 输出 channel 数，应该 <= 基础核数
+        seed: 随机种子，用于核扩展时的噪声生成（None 表示不固定种子）
     
     返回：
         shape (num_kernels, 3, kernel_size, kernel_size) 的张量
@@ -138,7 +139,8 @@ def create_srm_kernels(kernel_size: int = 5, num_kernels: int = 12) -> torch.Ten
     
     # 如果需要更多核，对基础核进行微小扰动
     if num_kernels > base_num:
-        np.random.seed(42)  # 保证可重复性
+        if seed is not None:
+            np.random.seed(seed)  # 保证可重复性
         for i in range(num_kernels - base_num):
             base_idx = i % base_num
             kernel = srm_base[base_idx:base_idx+1].copy()
@@ -167,6 +169,8 @@ class LearnableSRM(nn.Module):
         kernel_size: 卷积核大小（3 或 5，默认 5）
         use_bias: 是否使用偏置（推荐 False，因为 SRM 是残差滤波）
         freeze_init_epochs: 冻结该层多少个 epoch（0 表示不冻结）
+        use_norm: 是否在 SRM 后添加 GroupNorm（推荐 True 以稳定训练）
+        num_groups: GroupNorm 的分组数（默认 4，必须能整除 out_channels）
     """
     
     def __init__(
@@ -176,6 +180,10 @@ class LearnableSRM(nn.Module):
         kernel_size: int = 5,
         use_bias: bool = False,
         freeze_init_epochs: int = 0,
+        use_norm: bool = False,
+        num_groups: int = 4,
+        use_mixing: bool = False,
+        seed: Optional[int] = 42,
     ):
         super().__init__()
         
@@ -186,6 +194,8 @@ class LearnableSRM(nn.Module):
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.freeze_init_epochs = freeze_init_epochs
+        self.use_norm = use_norm
+        self.use_mixing = use_mixing
         
         # 创建卷积层
         padding = kernel_size // 2
@@ -197,8 +207,29 @@ class LearnableSRM(nn.Module):
             bias=use_bias,
         )
         
+        # 可选的 GroupNorm 层（比 BN 更稳定，不依赖 batch 统计）
+        if use_norm:
+            # 确保 num_groups 能整除 out_channels
+            if out_channels % num_groups != 0:
+                # 自动调整分组数
+                for g in [32, 16, 8, 4, 2, 1]:
+                    if out_channels % g == 0:
+                        num_groups = g
+                        break
+            self.norm = nn.GroupNorm(num_groups, out_channels)
+            print(f"  - Using GroupNorm with {num_groups} groups for output stabilization")
+        else:
+            self.norm = None
+        
+        # 可选的 1x1 conv 进行通道混合（让不同 SRM 核学习组合）
+        if use_mixing:
+            self.mixing = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
+            print(f"  - Using 1x1 conv for channel mixing (learnable kernel fusion)")
+        else:
+            self.mixing = None
+        
         # 用 SRM kernel 初始化权重
-        srm_kernels = create_srm_kernels(kernel_size, out_channels)
+        srm_kernels = create_srm_kernels(kernel_size, out_channels, seed=seed)
         # srm_kernels: (out_ch, 3, k, k)
         
         # 如果 in_channels != 3，进行调整
@@ -221,18 +252,25 @@ class LearnableSRM(nn.Module):
         print(f"  - Kernel size: {kernel_size}x{kernel_size}")
         print(f"  - Parameters: {out_channels * in_channels * kernel_size * kernel_size}")
         print(f"  - Freeze init epochs: {freeze_init_epochs}")
+        print(f"  - Normalization: {'GroupNorm' if use_norm else 'None'}")
     
     def freeze(self):
         """冻结该层的参数"""
         self.conv.weight.requires_grad = False
         if self.conv.bias is not None:
             self.conv.bias.requires_grad = False
+        if self.norm is not None:
+            for param in self.norm.parameters():
+                param.requires_grad = False
     
     def unfreeze(self):
         """解冻该层的参数"""
         self.conv.weight.requires_grad = True
         if self.conv.bias is not None:
             self.conv.bias.requires_grad = True
+        if self.norm is not None:
+            for param in self.norm.parameters():
+                param.requires_grad = True
     
     def set_learning_rate_scale(self, scale: float):
         """
@@ -251,7 +289,12 @@ class LearnableSRM(nn.Module):
         输入: (B, C, H, W)
         输出: (B, out_channels, H, W)
         """
-        return self.conv(x)
+        x = self.conv(x)
+        if self.norm is not None:
+            x = self.norm(x)
+        if self.mixing is not None:
+            x = self.mixing(x)
+        return x
     
     def __repr__(self):
         return (
@@ -296,6 +339,8 @@ class SRMBlock(nn.Module):
             self.bn = None
         
         if activation == 'relu':
+            print("⚠ Warning: ReLU will truncate negative residuals in SRM output!")
+            print("  Recommended: use 'leaky_relu' or None (identity) to preserve negative features.")
             self.act = nn.ReLU(inplace=True)
         elif activation == 'leaky_relu':
             self.act = nn.LeakyReLU(0.01, inplace=True)
@@ -331,16 +376,22 @@ def create_learnable_srm(
     kernel_size: int = 5,
     block_type: str = 'srm_only',
     freeze_init_epochs: int = 0,
+    use_norm: bool = False,
+    use_mixing: bool = False,
+    seed: Optional[int] = 42,
 ) -> nn.Module:
     """
     工厂函数：创建 SRM 模块
     
     参数：
         block_type: 
-            'srm_only': 仅 SRM，无激活
+            'srm_only': 仅 SRM，无激活（推荐，保留正负残差）
             'srm_bn': SRM + BatchNorm
-            'srm_bn_relu': SRM + BatchNorm + ReLU
-            'srm_bn_leaky': SRM + BatchNorm + LeakyReLU
+            'srm_bn_relu': SRM + BatchNorm + ReLU（警告：会丢失负残差）
+            'srm_bn_leaky': SRM + BatchNorm + LeakyReLU（推荐用于需要激活的场景）
+        use_norm: 是否在 SRM 后添加 GroupNorm（推荐用于稳定训练）
+        use_mixing: 是否添加 1x1 conv 进行通道混合（提升性能）
+        seed: 随机种子，用于核扩展（None 表示不固定）
     """
     if block_type == 'srm_only':
         return LearnableSRM(
@@ -348,6 +399,9 @@ def create_learnable_srm(
             out_channels=out_channels,
             kernel_size=kernel_size,
             freeze_init_epochs=freeze_init_epochs,
+            use_norm=use_norm,
+            use_mixing=use_mixing,
+            seed=seed,
         )
     elif block_type == 'srm_bn':
         return SRMBlock(
