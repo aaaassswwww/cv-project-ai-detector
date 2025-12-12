@@ -21,14 +21,64 @@ from utils.loss import build_loss
 from utils.transform import build_train_transform, build_val_transform
 
 
+def collate_fn_dual_stream(batch):
+    """
+    自定义 collate 函数，用于处理 DualStreamTransform 返回的字典数据
+    
+    处理不同数量的 patches：由于 var_thresh 过滤，不同图片可能返回不同数量的 patches
+    通过 padding 统一到最大的 K
+    
+    Args:
+        batch: List[Tuple[Dict, label]]
+            每个元素是 (data_dict, label)
+            data_dict = {'local': (K_i, 3, 256, 256), 'global': (3, H, W)}
+            注意：K_i 可能因图片而异
+    
+    Returns:
+        data_dict, labels
+            data_dict = {'local': (B, K_max, 3, 256, 256), 'global': (B, 3, H, W)}
+            labels: (B,)
+    """
+    data_dicts, labels = zip(*batch)
+    
+    # 找出最大的 patch 数量
+    max_k = max(d['local'].shape[0] for d in data_dicts)
+    
+    # Pad local patches 到相同的 K
+    # List[(K_i, 3, 256, 256)] -> (B, K_max, 3, 256, 256)
+    padded_locals = []
+    for d in data_dicts:
+        local = d['local']  # (K_i, 3, 256, 256)
+        k_i = local.shape[0]
+        
+        if k_i < max_k:
+            # 需要 padding：复制最后一个 patch 来填充
+            # 这样比用零填充更合理，避免引入全黑的 patch
+            padding_needed = max_k - k_i
+            last_patch = local[-1:].repeat(padding_needed, 1, 1, 1)  # (padding_needed, 3, 256, 256)
+            local = torch.cat([local, last_patch], dim=0)  # (K_max, 3, 256, 256)
+        
+        padded_locals.append(local)
+    
+    local_patches = torch.stack(padded_locals, dim=0)  # (B, K_max, 3, 256, 256)
+    
+    # Stack global images: List[(3, H, W)] -> (B, 3, H, W)
+    global_images = torch.stack([d['global'] for d in data_dicts], dim=0)
+    
+    # Stack labels: List[int] -> (B,)
+    labels = torch.tensor(labels, dtype=torch.long)
+    
+    return {'local': local_patches, 'global': global_images}, labels
+
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--num_epochs', default=10, type=int)
-parser.add_argument('--batch_size', default=64, type=int)
+parser.add_argument('--num_epochs', default=50, type=int)
+parser.add_argument('--batch_size', default=32, type=int)
 parser.add_argument('--learning_rate', default=1e-4, type=float)
 parser.add_argument('--weight_decay', default=1e-4, type=float)
 parser.add_argument('--patch_size', default=32, type=int)
 parser.add_argument('--split', default='train', type=str)
-parser.add_argument('--label_smoothing', default=0.0, type=float, help='label smoothing factor in [0,1]')
+parser.add_argument('--label_smoothing', default=0.1, type=float, help='label smoothing factor in [0,1]')
 parser.add_argument('--jpeg_p_global', default=0.2, type=float, help='probability of JPEG compression before patching')
 parser.add_argument('--jpeg_p_patch', default=0.05, type=float, help='probability of JPEG compression after patching')
 parser.add_argument('--jpeg_quality_min', default=30, type=int, help='min JPEG quality for compression augment')
@@ -70,7 +120,7 @@ parser.add_argument('--feature_fusion_type', default='concat', type=str, choices
 
 parser.add_argument('--seed', default=42, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
-parser.add_argument('--output_dir', default='checkpoints', type=str, help='output directory')
+parser.add_argument('--output_dir', default='/shared-nvme/checkpoints', type=str, help='output directory')
 parser.add_argument('--model_name', default='ssp', type=str)
 parser.add_argument('--warmup_epochs', default=3, type=int, help='warmup epochs')
 parser.add_argument('--early_stop_patience', default=8, type=int, help='early stopping patience (epochs)')
@@ -342,6 +392,10 @@ def main():
 
     worker_init_fn = make_worker_init_fn(args.seed)
 
+    # 根据是否使用 global_local 选择 collate_fn
+    use_custom_collate = hasattr(args, 'use_global_local') and args.use_global_local
+    custom_collate_fn = collate_fn_dual_stream if use_custom_collate else None
+
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
@@ -349,6 +403,7 @@ def main():
         num_workers=4,
         worker_init_fn=worker_init_fn,
         generator=generator,
+        collate_fn=custom_collate_fn,
     )
     
     val_loader = DataLoader(
@@ -358,6 +413,7 @@ def main():
         num_workers=4,
         worker_init_fn=worker_init_fn,
         generator=generator,
+        collate_fn=custom_collate_fn,
     )
     
     logger.info(f"Train set: {len(train_dataset)} images | Val set: {len(val_dataset)} images")
