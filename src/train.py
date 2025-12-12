@@ -398,7 +398,7 @@ def main():
         logger.info(f"    * Feature fusion: {args.feature_fusion_type}")
         
         model = GlobalLocalDualStream(
-            pretrain=True,
+            pretrain=False,  # 不使用预训练权重
             topk=args.patch_topk,
             use_learnable_srm=args.use_learnable_srm,
             learnable_srm_config=learnable_srm_config,
@@ -410,7 +410,7 @@ def main():
     else:
         logger.info("  - Using Single-Stream SSP architecture")
         model = ssp(
-            pretrain=True,
+            pretrain=False,  # 不使用预训练权重
             topk=args.patch_topk,
             use_learnable_srm=args.use_learnable_srm,
             learnable_srm_config=learnable_srm_config,
