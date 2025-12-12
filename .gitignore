@@ -8,6 +8,7 @@ fixes*
 fixes*.*
 test_*
 docs/*
+check*
 # Python 缓存文件
 __pycache__/
 *.py[cod]

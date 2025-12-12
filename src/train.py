@@ -120,7 +120,7 @@ parser.add_argument('--feature_fusion_type', default='concat', type=str, choices
 
 parser.add_argument('--seed', default=42, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
-parser.add_argument('--output_dir', default='/shared-nvme/checkpoints', type=str, help='output directory')
+parser.add_argument('--output_dir', default='/shared-nvme/outputs', type=str, help='output directory')
 parser.add_argument('--model_name', default='ssp', type=str)
 parser.add_argument('--warmup_epochs', default=3, type=int, help='warmup epochs')
 parser.add_argument('--early_stop_patience', default=8, type=int, help='early stopping patience (epochs)')
@@ -368,13 +368,52 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
     
+    # ===== 创建保存目录（带详细验证） =====
+    print(f"\n{'='*70}")
+    print("初始化保存目录...")
+    print(f"{'='*70}")
     
-    # 创建保存目录
-    os.makedirs(args.output_dir, exist_ok=True)
-    model_dir = os.path.join(args.output_dir, args.model_name)
-    os.makedirs(model_dir, exist_ok=True)
-
-    logger = init_logger(os.path.join(model_dir, 'train.log'))
+    # 创建输出目录
+    output_dir_abs = os.path.abspath(args.output_dir)
+    print(f"Output directory: {output_dir_abs}")
+    os.makedirs(output_dir_abs, exist_ok=True)
+    if os.path.exists(output_dir_abs):
+        print(f"✓ Output directory exists")
+    else:
+        print(f"❌ Failed to create output directory!")
+    
+    # 创建模型目录
+    model_dir = os.path.join(output_dir_abs, args.model_name)
+    model_dir_abs = os.path.abspath(model_dir)
+    print(f"Model directory: {model_dir_abs}")
+    os.makedirs(model_dir_abs, exist_ok=True)
+    if os.path.exists(model_dir_abs):
+        print(f"✓ Model directory exists")
+        # 测试写权限
+        test_file = os.path.join(model_dir_abs, '.write_test')
+        try:
+            with open(test_file, 'w') as f:
+                f.write('test')
+            os.remove(test_file)
+            print(f"✓ Write permission OK")
+        except Exception as e:
+            print(f"❌ Write permission ERROR: {e}")
+    else:
+        print(f"❌ Failed to create model directory!")
+    
+    # 初始化日志
+    log_path = os.path.join(model_dir_abs, 'train.log')
+    print(f"Log file: {log_path}")
+    logger = init_logger(log_path)
+    
+    # 验证日志文件是否创建
+    if os.path.exists(log_path):
+        print(f"✓ Log file created successfully")
+        print(f"  Size: {os.path.getsize(log_path)} bytes")
+    else:
+        print(f"❌ Log file not created!")
+    
+    print(f"{'='*70}\n")
     logger.info(f"Using device: {device}")
     if torch.cuda.is_available():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB")
@@ -501,6 +540,16 @@ def main():
         'val_loss': [], 'val_acc': [],
         'learning_rate': []
     }
+    
+    # 输出所有保存路径
+    logger.info("="*50)
+    logger.info("Output paths:")
+    logger.info(f"  - Model directory: {os.path.abspath(model_dir)}")
+    logger.info(f"  - Training log: {os.path.abspath(os.path.join(model_dir, 'train.log'))}")
+    logger.info(f"  - Best model: {os.path.abspath(os.path.join(model_dir, 'ai-detector_best.pth'))}")
+    logger.info(f"  - Checkpoints: {os.path.abspath(model_dir)}/checkpoint_epoch_*.pth")
+    logger.info(f"  - Training curve: {os.path.abspath('training_history.png')}")
+    logger.info("="*50)
     logger.info("Start training...")
     best_val_acc = 0.0
     best_val_loss = float('inf')
@@ -581,38 +630,71 @@ def main():
             best_val_loss = val_loss
             best_val_acc = val_acc
             no_improve_epochs = 0
-            best_path = os.path.join(model_dir, 'ai-detector_best.pth')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'val_acc': val_acc,
-                'val_loss': val_loss,
-                'train_acc': train_acc,
-                'train_loss': train_loss,
-                'args': vars(args),
-            }, best_path)
-            logger.info(f"✓ Saved best model to: {best_path} (ValLoss {val_loss:.4f}, ValAcc {val_acc:.2f}%)")
+            best_path = os.path.join(model_dir_abs, 'ai-detector_best.pth')
+            
+            # 保存前验证目录
+            if not os.path.exists(os.path.dirname(best_path)):
+                logger.warning(f"⚠ Directory doesn't exist, creating: {os.path.dirname(best_path)}")
+                os.makedirs(os.path.dirname(best_path), exist_ok=True)
+            
+            # 保存模型
+            try:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'val_acc': val_acc,
+                    'val_loss': val_loss,
+                    'train_acc': train_acc,
+                    'train_loss': train_loss,
+                    'args': vars(args),
+                }, best_path)
+                
+                # 验证文件确实被创建
+                if os.path.exists(best_path):
+                    file_size = os.path.getsize(best_path) / (1024 * 1024)  # MB
+                    logger.info(f"✓ Saved best model (ValLoss {val_loss:.4f}, ValAcc {val_acc:.2f}%)")
+                    logger.info(f"  → {os.path.abspath(best_path)}")
+                    logger.info(f"  → Size: {file_size:.2f} MB")
+                else:
+                    logger.error(f"❌ File save claimed success but file doesn't exist!")
+                    logger.error(f"  → Attempted path: {os.path.abspath(best_path)}")
+            except Exception as e:
+                logger.error(f"❌ Failed to save model: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
         else:
             no_improve_epochs += 1
             logger.info(f"↻ No significant val improvement ({no_improve_epochs}/{args.early_stop_patience})")
         
         # 每5个epoch保存一次检查点
         if (epoch + 1) % 5 == 0:
-            checkpoint_path = os.path.join(model_dir, f'checkpoint_epoch_{epoch+1}.pth')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'val_acc': val_acc,
-                'val_loss': val_loss,
-                'train_acc': train_acc,
-                'train_loss': train_loss,
-                'args': vars(args),
-            }, checkpoint_path)
-            logger.info(f"✓ Saved checkpoint to: {checkpoint_path}")
+            checkpoint_path = os.path.join(model_dir_abs, f'checkpoint_epoch_{epoch+1}.pth')
+            
+            try:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'val_acc': val_acc,
+                    'val_loss': val_loss,
+                    'train_acc': train_acc,
+                    'train_loss': train_loss,
+                    'args': vars(args),
+                }, checkpoint_path)
+                
+                # 验证文件
+                if os.path.exists(checkpoint_path):
+                    file_size = os.path.getsize(checkpoint_path) / (1024 * 1024)  # MB
+                    logger.info(f"✓ Saved checkpoint (epoch {epoch+1})")
+                    logger.info(f"  → {os.path.abspath(checkpoint_path)}")
+                    logger.info(f"  → Size: {file_size:.2f} MB")
+                else:
+                    logger.error(f"❌ Checkpoint save failed - file doesn't exist!")
+            except Exception as e:
+                logger.error(f"❌ Failed to save checkpoint: {e}")
 
         # 早停
         if no_improve_epochs >= args.early_stop_patience:
@@ -626,6 +708,63 @@ def main():
     logger.info("="*50)
     logger.info("Training finished!")
     logger.info(f"Best val accuracy: {best_val_acc:.2f}%")
+    logger.info("="*50)
+    logger.info("Saved files:")
+    
+    # 检查并列出所有文件
+    best_model_path = os.path.join(model_dir_abs, 'ai-detector_best.pth')
+    log_path = os.path.join(model_dir_abs, 'train.log')
+    curve_path = os.path.abspath('training_history.png')
+    
+    if os.path.exists(best_model_path):
+        size_mb = os.path.getsize(best_model_path) / (1024 * 1024)
+        logger.info(f"  ✓ Best model: {best_model_path} ({size_mb:.2f} MB)")
+    else:
+        logger.warning(f"  ❌ Best model NOT FOUND: {best_model_path}")
+    
+    if os.path.exists(log_path):
+        size_kb = os.path.getsize(log_path) / 1024
+        logger.info(f"  ✓ Training log: {log_path} ({size_kb:.2f} KB)")
+    else:
+        logger.warning(f"  ❌ Training log NOT FOUND: {log_path}")
+    
+    if os.path.exists(curve_path):
+        size_kb = os.path.getsize(curve_path) / 1024
+        logger.info(f"  ✓ Training curve: {curve_path} ({size_kb:.2f} KB)")
+    else:
+        logger.warning(f"  ❌ Training curve NOT FOUND: {curve_path}")
+    
+    # 列出所有保存的checkpoint
+    import glob
+    checkpoints = glob.glob(os.path.join(model_dir_abs, 'checkpoint_epoch_*.pth'))
+    if checkpoints:
+        logger.info(f"  ✓ Checkpoints ({len(checkpoints)}):")
+        for ckpt in sorted(checkpoints):
+            size_mb = os.path.getsize(ckpt) / (1024 * 1024)
+            logger.info(f"    * {ckpt} ({size_mb:.2f} MB)")
+    else:
+        logger.warning(f"  ❌ No checkpoints found in {model_dir_abs}")
+    
+    # 列出目录中的所有文件
+    logger.info(f"\n  Directory contents: {model_dir_abs}")
+    try:
+        all_files = os.listdir(model_dir_abs)
+        if all_files:
+            for f in sorted(all_files):
+                f_path = os.path.join(model_dir_abs, f)
+                if os.path.isfile(f_path):
+                    size = os.path.getsize(f_path)
+                    if size > 1024 * 1024:
+                        size_str = f"{size / (1024 * 1024):.2f} MB"
+                    else:
+                        size_str = f"{size / 1024:.2f} KB"
+                    logger.info(f"    - {f} ({size_str})")
+        else:
+            logger.warning(f"    Directory is empty!")
+    except Exception as e:
+        logger.error(f"    Failed to list directory: {e}")
+    
+    logger.info("="*50)
     
     return model, history
 
