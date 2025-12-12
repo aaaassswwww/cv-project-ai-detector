@@ -21,6 +21,51 @@ from utils.loss import build_loss
 from utils.transform import build_train_transform, build_val_transform
 
 
+def collate_fn_patches(batch):
+    """
+    自定义 collate 函数，用于处理不同数量的 patches
+    
+    处理不同数量的 patches：由于 var_thresh 过滤，不同图片可能返回不同数量的 patches
+    通过 padding 统一到最大的 K
+    
+    Args:
+        batch: List[Tuple[Tensor, label]]
+            每个元素是 (patches, label)
+            patches: (K_i, 3, 256, 256) - K_i 可能因图片而异
+    
+    Returns:
+        patches, labels
+            patches: (B, K_max, 3, 256, 256)
+            labels: (B,)
+    """
+    patches_list, labels = zip(*batch)
+    
+    # 找出最大的 patch 数量
+    max_k = max(p.shape[0] for p in patches_list)
+    
+    # Pad patches 到相同的 K
+    # List[(K_i, 3, 256, 256)] -> (B, K_max, 3, 256, 256)
+    padded_patches = []
+    for patches in patches_list:
+        k_i = patches.shape[0]
+        
+        if k_i < max_k:
+            # 需要 padding：复制最后一个 patch 来填充
+            # 这样比用零填充更合理，避免引入全黑的 patch
+            padding_needed = max_k - k_i
+            last_patch = patches[-1:].repeat(padding_needed, 1, 1, 1)  # (padding_needed, 3, 256, 256)
+            patches = torch.cat([patches, last_patch], dim=0)  # (K_max, 3, 256, 256)
+        
+        padded_patches.append(patches)
+    
+    patches_batch = torch.stack(padded_patches, dim=0)  # (B, K_max, 3, 256, 256)
+    
+    # Stack labels: List[int] -> (B,)
+    labels = torch.tensor(labels, dtype=torch.long)
+    
+    return patches_batch, labels
+
+
 def collate_fn_dual_stream(batch):
     """
     自定义 collate 函数，用于处理 DualStreamTransform 返回的字典数据
@@ -432,8 +477,15 @@ def main():
     worker_init_fn = make_worker_init_fn(args.seed)
 
     # 根据是否使用 global_local 选择 collate_fn
-    use_custom_collate = hasattr(args, 'use_global_local') and args.use_global_local
-    custom_collate_fn = collate_fn_dual_stream if use_custom_collate else None
+    # 注意：即使不使用 global_local，如果 patch_var_thresh > 0，不同图像可能返回不同数量的 patches
+    # 因此 SSP 模型也需要自定义 collate_fn
+    use_global_local = hasattr(args, 'use_global_local') and args.use_global_local
+    if use_global_local:
+        custom_collate_fn = collate_fn_dual_stream
+    else:
+        # SSP 模型：处理 (K, C, H, W) 格式的 patches
+        # 如果 patch_var_thresh > 0，K 可能不同，需要 padding
+        custom_collate_fn = collate_fn_patches
 
     train_loader = DataLoader(
         train_dataset, 

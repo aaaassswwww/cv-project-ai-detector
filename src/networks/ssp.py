@@ -61,8 +61,12 @@ class ssp(nn.Module):
         else:
             print("✓ Using classic SRMConv2d")
             self.srm = SRMConv2d_simple()
-            # SRMConv2d_simple 输出 64 通道
-            self.srm_out_channels = 64
+            # SRMConv2d_simple 输出 3 通道 (64 -> 3)
+            #问题：SRMConv2d_simple 实际输出 3 个通道，但 ssp.py 中将其标记为 64。验证实际输出通道数：
+            #SRMConv2d_simple 的 _build_kernel 创建了形状为 (3, 3, 5, 5) 的滤波器，即输出 3 个通道。
+            #修复：将 ssp.py 中的 self.srm_out_channels = 64 改为 self.srm_out_channels = 3。
+
+            self.srm_out_channels = 3
         
         # Fusion layer：如果使用 concat 模式，需要一个小卷积层来融合 SRM + RGB
         if fusion_mode == 'concat':
