@@ -29,13 +29,13 @@ parser = argparse.ArgumentParser(description='使用 TTA 进行模型评估')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
 parser.add_argument('--split', default='test', type=str, help="dataset split in ['val', 'test']")
 parser.add_argument('--model_name', default='ssp', type=str)
-parser.add_argument('--model_path', default="./checkpoints", help='Pretrained Model Path')
+parser.add_argument('--model_path', default="./shared-nvme/ssp-models", help='Pretrained Model Path')
 parser.add_argument('--output_file', default=None, help='CSV output file (default: result_tta_{mode}.csv)')
 parser.add_argument('--batch_size', default=1, type=int, help='batch size (TTA uses single image)')
 parser.add_argument('--seed', default=42, type=int, help='random seed')
 
 # TTA 参数
-parser.add_argument('--tta_mode', default='standard', type=str, 
+parser.add_argument('--tta_mode', default='full', type=str, 
                     choices=['full', 'standard', 'simple', 'minimal'],
                     help='TTA mode: full (all), standard (recommended), simple (fast), minimal (hflip only)')
 parser.add_argument('--tta_hflip', action='store_true', help='enable horizontal flip')
@@ -49,11 +49,19 @@ parser.add_argument('--tta_aggregation', default='mean', type=str,
 
 # Learnable SRM 参数（如果模型使用了）
 parser.add_argument('--use_learnable_srm', action='store_true', help='model uses learnable SRM')
-parser.add_argument('--fusion_mode', default='replace', type=str, 
+parser.add_argument('--fusion_mode', default='concat', type=str, 
                     choices=['replace', 'concat', 'dual_stream'],
                     help='fusion mode of the model')
 
-parser.add_argument('--patch_topk', default=1, type=int, help='top-K patches to use')
+# Global-Local Dual Stream 参数
+parser.add_argument('--use_global_local', action='store_true', help='model uses Global-Local Dual Stream architecture')
+parser.add_argument('--global_size', default=384, type=int, help='global stream input size')
+parser.add_argument('--share_backbone', action='store_true', help='share ResNet backbone between streams')
+parser.add_argument('--feature_fusion_type', default='concat', type=str, 
+                    choices=['concat', 'add', 'attention'],
+                    help='feature fusion type')
+
+parser.add_argument('--patch_topk', default=5, type=int, help='top-K patches to use')
 parser.add_argument('--patch_size', default=32, type=int, help='patch size')
 
 args = parser.parse_args()
@@ -72,9 +80,17 @@ def load_model(model_path, device):
     # 从 checkpoint 获取模型参数
     saved_args = checkpoint.get('args', {})
     
+    # 获取训练时使用的 topk（关键参数！）
+    saved_topk = saved_args.get('patch_topk', 1)
+    if saved_topk != args.patch_topk:
+        print(f"⚠ Warning: Model was trained with topk={saved_topk}, but you specified topk={args.patch_topk}")
+        print(f"  → Using topk={saved_topk} from checkpoint")
+        args.patch_topk = saved_topk
+    
     # 构建模型
     use_learnable_srm = saved_args.get('use_learnable_srm', args.use_learnable_srm)
     fusion_mode = saved_args.get('fusion_mode', args.fusion_mode)
+    use_global_local = saved_args.get('use_global_local', args.use_global_local)
     
     learnable_srm_config = None
     if use_learnable_srm:
@@ -89,19 +105,79 @@ def load_model(model_path, device):
         print(f"✓ Model uses Learnable SRM: {learnable_srm_config}")
         print(f"✓ Fusion mode: {fusion_mode}")
     
-    model = ssp(
-        pretrain=False,
-        topk=args.patch_topk,
-        use_learnable_srm=use_learnable_srm,
-        learnable_srm_config=learnable_srm_config,
-        fusion_mode=fusion_mode,
-    )
+    # 根据训练时的架构选择模型
+    if use_global_local:
+        from networks.global_local import GlobalLocalDualStream
+        
+        global_size = saved_args.get('global_size', args.global_size)
+        share_backbone = saved_args.get('share_backbone', args.share_backbone)
+        feature_fusion_type = saved_args.get('feature_fusion_type', args.feature_fusion_type)
+        
+        print(f"✓ Using Global-Local Dual Stream architecture")
+        print(f"  - Global size: {global_size}x{global_size}")
+        print(f"  - Share backbone: {share_backbone}")
+        print(f"  - Feature fusion: {feature_fusion_type}")
+        
+        model = GlobalLocalDualStream(
+            pretrain=False,
+            topk=saved_topk,
+            use_learnable_srm=use_learnable_srm,
+            learnable_srm_config=learnable_srm_config,
+            fusion_mode=fusion_mode,
+            global_size=global_size,
+            share_backbone=share_backbone,
+            fusion_type=feature_fusion_type,
+        )
+    else:
+        print(f"✓ Using Single-Stream SSP architecture")
+        model = ssp(
+            pretrain=False,
+            topk=saved_topk,  # 使用训练时的 topk
+            use_learnable_srm=use_learnable_srm,
+            learnable_srm_config=learnable_srm_config,
+            fusion_mode=fusion_mode,
+        )
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # 尝试加载模型权重，并提供详细的调试信息
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    except RuntimeError as e:
+        print(f"⚠ Warning: Strict loading failed, trying with strict=False")
+        print(f"  Error: {str(e)[:200]}...")
+        
+        # 打印调试信息
+        checkpoint_keys = set(checkpoint['model_state_dict'].keys())
+        model_keys = set(model.state_dict().keys())
+        
+        missing_in_checkpoint = model_keys - checkpoint_keys
+        unexpected_in_checkpoint = checkpoint_keys - model_keys
+        
+        if missing_in_checkpoint:
+            print(f"\n  Missing in checkpoint ({len(missing_in_checkpoint)} keys):")
+            for key in list(missing_in_checkpoint)[:5]:
+                print(f"    - {key}")
+            if len(missing_in_checkpoint) > 5:
+                print(f"    ... and {len(missing_in_checkpoint) - 5} more")
+        
+        if unexpected_in_checkpoint:
+            print(f"\n  Unexpected in checkpoint ({len(unexpected_in_checkpoint)} keys):")
+            for key in list(unexpected_in_checkpoint)[:5]:
+                print(f"    - {key}")
+            if len(unexpected_in_checkpoint) > 5:
+                print(f"    ... and {len(unexpected_in_checkpoint) - 5} more")
+        
+        # 使用 strict=False 加载
+        result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        print(f"\n✓ Model loaded with strict=False")
+        if result.missing_keys:
+            print(f"  ⚠ {len(result.missing_keys)} missing keys (will use random init)")
+        if result.unexpected_keys:
+            print(f"  ⚠ {len(result.unexpected_keys)} unexpected keys (ignored)")
+    
     model = model.to(device)
     model.eval()
     
-    print(f"✓ Model loaded from: {full_model_path}")
+    print(f"\n✓ Model loaded from: {full_model_path}")
     print(f"✓ Model epoch: {checkpoint.get('epoch', 'unknown')}")
     print(f"✓ Model val_acc: {checkpoint.get('val_acc', 'unknown'):.2f}%")
     

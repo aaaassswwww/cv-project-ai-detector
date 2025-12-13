@@ -677,8 +677,9 @@ def main():
         )
         logger.info(f"Confusion matrix:\n{cm}")
         
-        # 保存最佳模型（以验证损失为准，支持早停）
-        if val_loss + args.min_delta < best_val_loss:
+        # 保存最佳模型（以验证准确率为准，支持早停）
+        # 注意：对于分类任务，通常以准确率作为主要指标更合理
+        if val_acc > best_val_acc:
             best_val_loss = val_loss
             best_val_acc = val_acc
             no_improve_epochs = 0
