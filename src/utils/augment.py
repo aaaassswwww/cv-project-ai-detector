@@ -108,3 +108,82 @@ class RandomFreqPerturbation:
         freq = freq * mask
         perturbed = torch.fft.ifftn(freq, dim=(-2, -1)).real
         return perturbed.clamp(0.0, 1.0)
+
+
+class RandomFDA:
+    """
+    FDA (Fourier Domain Adaptation) augmentation for low-frequency domain mixing.
+    
+    Replaces low-frequency amplitude of source image with target image's amplitude,
+    while keeping source phase intact. Only affects central low-frequency region
+    (controlled by beta_range) to preserve high-frequency forensic features.
+    
+    Args:
+        beta_range: Range of beta values (e.g., (0.01, 0.05) means 1-5% of image size)
+                   Controls the size of low-frequency region to replace
+        p: Probability of applying FDA (default: 0.3)
+    
+    Example:
+        beta=0.05, image 384x384 -> replace central 38x38 region in frequency domain
+        This affects global color/lighting/texture style while preserving local forensic traces
+    """
+    
+    def __init__(self, beta_range: Tuple[float, float] = (0.01, 0.05), p: float = 0.3):
+        self.beta_range = beta_range
+        self.p = p
+
+    def __call__(self, src: torch.Tensor, trg: torch.Tensor) -> torch.Tensor:
+        """
+        Apply FDA augmentation.
+        
+        Args:
+            src: Source tensor in [0,1] range, shape (C, H, W)
+            trg: Target tensor in [0,1] range, shape (C, H, W)
+        
+        Returns:
+            Augmented tensor in [0,1] range with src's phase and mixed amplitude
+        """
+        # Skip if no target or random check fails
+        if trg is None or random.random() > self.p:
+            return src
+        
+        # Skip if shapes don't match
+        if src.shape != trg.shape:
+            return src
+
+        # Perform 2D FFT on H and W dimensions
+        fft_src = torch.fft.fftn(src, dim=(-2, -1))
+        fft_trg = torch.fft.fftn(trg, dim=(-2, -1))
+
+        # Shift zero-frequency component to center (low-freq becomes central)
+        fft_src = torch.fft.fftshift(fft_src, dim=(-2, -1))
+        fft_trg = torch.fft.fftshift(fft_trg, dim=(-2, -1))
+
+        # Extract amplitude and phase
+        amp_src = torch.abs(fft_src)
+        pha_src = torch.angle(fft_src)
+        amp_trg = torch.abs(fft_trg)
+
+        # Calculate replacement region size
+        _, h, w = src.shape
+        beta = random.uniform(self.beta_range[0], self.beta_range[1])
+        b_h = max(1, int(h * beta))
+        b_w = max(1, int(w * beta))
+
+        # Calculate center region bounds
+        c_h, c_w = h // 2, w // 2
+        h1, h2 = c_h - b_h, c_h + b_h
+        w1, w2 = c_w - b_w, c_w + b_w
+
+        # Replace center (low-frequency) amplitude with target's amplitude
+        amp_src[:, h1:h2, w1:w2] = amp_trg[:, h1:h2, w1:w2]
+
+        # Reconstruct complex spectrum with mixed amplitude and source phase
+        fft_new = torch.polar(amp_src, pha_src)
+
+        # Inverse shift and inverse FFT
+        fft_new = torch.fft.ifftshift(fft_new, dim=(-2, -1))
+        out = torch.fft.ifftn(fft_new, dim=(-2, -1)).real
+
+        # Clamp to valid range [0, 1]
+        return torch.clamp(out, 0.0, 1.0)

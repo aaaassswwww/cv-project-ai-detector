@@ -172,10 +172,11 @@ def predict_test_set(model, device):
         print(f"✓ Detected Global-Local Dual Stream architecture")
         from torchvision import transforms
         # 准备全局图像的 transform
-        # 注意：训练时没有使用 ImageNet normalization，保持 [0,1] 范围
+        # 注意：必须使用 ImageNet normalization（与训练时一致）
         global_transform = transforms.Compose([
             transforms.Resize((args.global_size, args.global_size)),
-            transforms.ToTensor(),  # 输出 [0,1] 范围，不使用 normalize
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     else:
         print(f"✓ Detected Single-Stream architecture")

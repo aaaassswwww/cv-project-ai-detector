@@ -65,7 +65,21 @@ class Dataset(data.Dataset):
             image = Image.new('RGB', (224, 224), color='black')
 
         if self.transforms:
-            image = self.transforms(image)
+            # 训练时如果transform支持FDA，随机选择一张target图像
+            if self.train and hasattr(self.transforms, 'enable_fda') and getattr(self.transforms, 'enable_fda', False):
+                # 随机选择一个不同的索引作为FDA target
+                rand_idx = torch.randint(0, len(self.image_paths), (1,)).item()
+                if rand_idx == idx:
+                    rand_idx = (rand_idx + 1) % len(self.image_paths)
+                
+                try:
+                    target_img = Image.open(self.image_paths[rand_idx]).convert('RGB')
+                except Exception:
+                    target_img = None
+                
+                image = self.transforms(image, target_img)
+            else:
+                image = self.transforms(image)
 
         return image, label
 

@@ -343,7 +343,7 @@ class GlobalLocalDualStream(nn.Module):
 # 便捷工厂函数
 def create_global_local_model(
     model_type: str = 'standard',
-    pretrain: bool = True,
+    pretrain: bool = False,
     use_learnable_srm: bool = True,
     **kwargs
 ) -> GlobalLocalDualStream:

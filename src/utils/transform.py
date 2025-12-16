@@ -13,6 +13,7 @@ from .augment import (
     RandomGaussianNoise,
     RandomJPEGCompression,
     RandomResample,
+    RandomFDA,
 )
 
 
@@ -272,6 +273,9 @@ class DualStreamTransform:
         apply_global_jpeg: bool = True,
         jpeg_p: float = 0.2,
         jpeg_quality_range: tuple = (30, 95),
+        enable_fda: bool = False,
+        fda_p: float = 0.3,
+        fda_beta_range: tuple = (0.01, 0.05),
     ):
         """
         参数：
@@ -283,21 +287,34 @@ class DualStreamTransform:
             apply_global_jpeg: 是否在提取 patch 前对原图应用 JPEG 压缩
             jpeg_p: JPEG 压缩概率
             jpeg_quality_range: JPEG 质量范围
+            enable_fda: 是否启用FDA (Fourier Domain Adaptation) 增强
+            fda_p: FDA应用概率
+            fda_beta_range: FDA的beta范围，控制低频替换区域大小
         """
         self.global_size = global_size
         self.patch_fn = patch_fn
         self.apply_global_jpeg = apply_global_jpeg
+        self.enable_fda = enable_fda
         
         # 全局 JPEG 增强（可选）
         if apply_global_jpeg:
             self.global_jpeg = RandomJPEGCompression(p=jpeg_p, quality_range=jpeg_quality_range)
         
-        # 全局图处理：Resize + ToTensor
-        # 注意：保持 [0,1] 范围，不使用 ImageNet normalize
-        self.global_transform = transforms.Compose([
+        # 全局图处理：拆分为 base transform + normalize
+        # 这样FDA可以在[0,1]范围内操作，然后再normalize
+        self.global_base = transforms.Compose([
             transforms.Resize((global_size, global_size)),
-            transforms.ToTensor(),
+            transforms.ToTensor(),  # -> [0,1]
         ])
+        
+        # ImageNet normalization (Global stream使用ResNet，需要标准化)
+        self.global_norm = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+        
+        # FDA增强（在normalize之前应用）
+        self.fda = RandomFDA(beta_range=fda_beta_range, p=fda_p) if enable_fda else None
         
         # Local patch 处理
         self.patch_transform = PatchTransform(
@@ -306,19 +323,30 @@ class DualStreamTransform:
             augment_config=augment_config,
         )
     
-    def __call__(self, img: Image.Image) -> dict:
+    def __call__(self, img: Image.Image, target_img: Optional[Image.Image] = None) -> dict:
         """
-        输入：PIL Image（原始图像）
-        输出：字典 {'global': Tensor(C,H,W), 'local': Tensor(K,C,H,W)}
+        输入：
+            img: PIL Image（原始图像）
+            target_img: 可选的目标图像，用于FDA增强（仅训练时提供）
+        输出：
+            字典 {'global': Tensor(C,H,W), 'local': Tensor(K,C,H,W)}
         """
         # 1. 可选的全局 JPEG 压缩（在分流前应用）
         if self.apply_global_jpeg:
             img = self.global_jpeg(img)
         
-        # 2. Global Stream: 处理完整图像
-        x_global = self.global_transform(img)  # (3, global_size, global_size)
+        # 2. Global Stream: base -> FDA -> normalize
+        x_global = self.global_base(img)  # (3, H, W) in [0,1]
         
-        # 3. Local Stream: 提取 patch 并处理
+        # 2.1 可选的FDA增强（需要target_img）
+        if self.enable_fda and target_img is not None:
+            x_target = self.global_base(target_img)  # (3, H, W) in [0,1]
+            x_global = self.fda(x_global, x_target)  # still [0,1]
+        
+        # 2.2 Normalize (必须在FDA之后)
+        x_global = self.global_norm(x_global)  # (3, H, W) normalized
+        
+        # 3. Local Stream: 提取 patch 并处理（不应用FDA）
         patches = self.patch_fn(img)  # 返回 PIL Image 或 list of PIL Images
         x_local = self.patch_transform(patches)  # (K, 3, 256, 256)
         
@@ -374,6 +402,10 @@ def build_dual_stream_train_transform(args, patch_fn: Callable) -> DualStreamTra
         apply_global_jpeg=True,
         jpeg_p=args.jpeg_p_global,
         jpeg_quality_range=(args.jpeg_quality_min, args.jpeg_quality_max),
+        # FDA增强（仅Global stream，仅训练时）
+        enable_fda=True,
+        fda_p=0.3,  # 30%概率应用FDA
+        fda_beta_range=(0.01, 0.05),  # 替换低频1-5%区域
     )
 
 
@@ -395,4 +427,5 @@ def build_dual_stream_val_transform(args, patch_fn: Callable) -> DualStreamTrans
         apply_augment=False,  # 验证时不增强
         augment_config=None,
         apply_global_jpeg=False,  # 验证时不压缩
+        enable_fda=False,  # 验证时不用FDA（保持评估纯净）
     )
