@@ -165,10 +165,10 @@ parser.add_argument('--feature_fusion_type', default='concat', type=str, choices
 
 parser.add_argument('--seed', default=42, type=int, help='random seed')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
-parser.add_argument('--output_dir', default='/shared-nvme/outputs', type=str, help='output directory')
+parser.add_argument('--output_dir', default='./shared-nvme/ssp-models', type=str, help='output directory')
 parser.add_argument('--model_name', default='ssp', type=str)
 parser.add_argument('--warmup_epochs', default=3, type=int, help='warmup epochs')
-parser.add_argument('--early_stop_patience', default=8, type=int, help='early stopping patience (epochs)')
+parser.add_argument('--early_stop_patience', default=10, type=int, help='early stopping patience (epochs)')
 parser.add_argument('--min_delta', default=1e-4, type=float, help='minimum val loss improvement to reset patience')
 parser.add_argument('--eta_min', default=1e-6, type=float, help='minimum lr for cosine annealing')
 
