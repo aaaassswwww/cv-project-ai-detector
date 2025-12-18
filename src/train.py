@@ -48,6 +48,8 @@ def collate_fn_patches(batch):
     padded_patches = []
     for patches in patches_list:
         k_i = patches.shape[0]
+        # 必须 clone 以避免多进程 DataLoader 中的内存共享问题
+        patches = patches.clone()
         
         if k_i < max_k:
             # 需要 padding：复制最后一个 patch 来填充
@@ -95,6 +97,8 @@ def collate_fn_dual_stream(batch):
     for d in data_dicts:
         local = d['local']  # (K_i, 3, 256, 256)
         k_i = local.shape[0]
+        # 必须 clone 以避免多进程 DataLoader 中的内存共享问题
+        local = local.clone()
         
         if k_i < max_k:
             # 需要 padding：复制最后一个 patch 来填充
@@ -108,7 +112,8 @@ def collate_fn_dual_stream(batch):
     local_patches = torch.stack(padded_locals, dim=0)  # (B, K_max, 3, 256, 256)
     
     # Stack global images: List[(3, H, W)] -> (B, 3, H, W)
-    global_images = torch.stack([d['global'] for d in data_dicts], dim=0)
+    # Clone 以避免多进程问题
+    global_images = torch.stack([d['global'].clone() for d in data_dicts], dim=0)
     
     # Stack labels: List[int] -> (B,)
     labels = torch.tensor(labels, dtype=torch.long)

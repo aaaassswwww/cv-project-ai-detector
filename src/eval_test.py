@@ -1,30 +1,7 @@
 """
-对测试集进行预测（支持有标签评估 Accuracy + 阈值扫描 + 更强 patch 聚合 + Global-Local TTA）
+对测试集进行预测
 
-用法示例：
-1) 只跑默认阈值0.5并算accuracy（需要label_csv）:
-   python src/eval_test.py --label_csv dataset/test_labels.csv
-
-2) 扫描最优阈值（最大化accuracy）:
-   python src/eval_test.py --label_csv dataset/test_labels.csv --optimize_threshold
-
-3) 更强 patch 聚合（推荐）:
-   python src/eval_test.py --label_csv dataset/test_labels.csv --optimize_threshold --patch_agg topm --patch_agg_m 2
-
-4) Global-Local 也开TTA（JPEG + hflip）:
-   python src/eval_test.py --use_global_local --tta_mode standard --tta_global_local --tta_jpeg --tta_hflip_gl \
-       --label_csv dataset/test_labels.csv --optimize_threshold --patch_agg topm --patch_agg_m 2
-
-python src/eval_test.py \
-  --use_global_local \
-  --label_csv dataset/test_labels.csv \
-  --optimize_threshold \
-  --tta_mode standard \
-  --tta_global_local \
-  --tta_jpeg \
-  --tta_hflip_gl \
-  --patch_agg topm --patch_agg_m 2 \
-  --output_file preds_debug.csv
+python src/eval_test.py   --use_global_local   --label_csv dataset/test_labels.csv --shift_method tent --tent_steps 1 --tent_lr 1e-4 --tent_reset_each_image  --optimize_threshold   --tta_mode standard   --tta_global_local   --tta_jpeg   --tta_hflip_gl   --patch_agg topm --patch_agg_m 2  
 """
 
 from PIL import Image
@@ -36,6 +13,8 @@ import pandas as pd
 import numpy as np
 import time
 import io
+import torch.nn as nn
+import copy
 
 from networks.ssp import ssp
 from utils.patch import patch_img_deterministic
@@ -49,10 +28,11 @@ from utils.transform import PatchTransform
 parser = argparse.ArgumentParser(description='对测试集进行预测（可选TTA/阈值扫描/评估accuracy）')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
 parser.add_argument('--test_dir', default='test', type=str, help='test directory name')
-parser.add_argument('--model_name', default='ssp', type=str)
+parser.add_argument('--model_name', default='ssp-fda', type=str)
 parser.add_argument('--model_path', default="./shared-nvme/ssp-models", help='Model Path root')
 parser.add_argument('--output_file', default='predictions.csv', help='CSV output file')
 parser.add_argument('--seed', default=42, type=int, help='random seed')
+parser.add_argument('--patch_var_thresh', default=5.0, type=float)
 
 # 标签与评估
 parser.add_argument('--label_csv', default='dataset/test_labels.csv', type=str, help='test label csv: image_id,label')
@@ -100,7 +80,74 @@ parser.add_argument('--tta_global_local', action='store_true', help='enable simp
 parser.add_argument('--tta_jpeg_qualities', default='60,80,95', type=str, help='comma-separated jpeg qualities for GL TTA')
 parser.add_argument('--tta_hflip_gl', action='store_true', help='hflip for GL TTA')
 
+# AdaBN
+parser.add_argument('--shift_method', default='none', type=str,
+                    choices=['none', 'adabn', 'tent'],
+                    help='domain shift mitigation at test time')
+parser.add_argument('--adabn_passes', default=1, type=int, help='passes over test set to update BN stats')
+parser.add_argument('--adabn_max_images', default=-1, type=int, help='limit images for AdaBN (-1 = all)')
+
+# TENT
+parser.add_argument('--tent_steps', default=1, type=int, help='gradient steps per image/batch')
+parser.add_argument('--tent_lr', default=1e-4, type=float)
+parser.add_argument('--tent_reset_each_image', action='store_true', help='reset BN affine each image (safer)')
+
 args = parser.parse_args()
+
+# TENT
+def tent_prepare(model):
+    # 冻结全部
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # 只打开 BN affine
+    tent_params = []
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            if m.affine:
+                m.weight.requires_grad = True
+                m.bias.requires_grad = True
+                tent_params += [m.weight, m.bias]
+    return tent_params
+
+def binary_entropy_from_logits(logits):
+    # logits: (N,)
+    p = torch.sigmoid(logits)
+    eps = 1e-6
+    ent = -(p * torch.log(p + eps) + (1 - p) * torch.log(1 - p + eps))
+    return ent.mean()
+
+
+# AdaBN
+def _set_bn_train_only(m):
+    if isinstance(m, nn.modules.batchnorm._BatchNorm):
+        m.train()
+    elif isinstance(m, nn.Dropout):
+        m.eval()
+
+def adabn_update_bn_stats(model, device, all_images, is_global_local,
+                          patch_fn, transform_fn, global_transform):
+    print("\n[ AdaBN ] Updating BN running stats on target/test images ...")
+    model.train()
+    model.apply(_set_bn_train_only)
+
+    with torch.no_grad():
+        for img_path in tqdm(all_images, desc="AdaBN"):
+            img = Image.open(img_path).convert('RGB')
+
+            patches = patch_fn(img)
+            patches = transform_fn(patches).unsqueeze(0).to(device)  # (1,K,C,H,W)
+            b, k, c, h, w = patches.shape
+            patches_flat = patches.view(b * k, c, h, w)
+
+            if is_global_local:
+                global_img = global_transform(img).unsqueeze(0).to(device)
+                _ = model(patches_flat, global_img)
+            else:
+                _ = model(patches_flat)
+
+    model.eval()
+    print("[ AdaBN ] Done.\n")
 
 
 def load_test_labels(label_csv: str):
@@ -140,12 +187,18 @@ def aggregate_patches_from_logits(logits_1d: torch.Tensor, mode: str = 'mean', m
 
 def load_model(model_root, device):
     """加载模型（从checkpoint读取训练时关键参数，保证推理一致）"""
-    full_model_path = os.path.join(model_root, args.model_name, 'ai-detector_best.pth')
+    full_model_path = os.path.join(model_root, args.model_name, 'checkpoint_epoch_25.pth')
+    # full_model_path = os.path.join(model_root, args.model_name, 'checkpoint_epoch_20.pth')
+    # full_model_path = os.path.join(model_root, args.model_name, 'ai-detector_best.pth')
     if not os.path.exists(full_model_path):
         raise FileNotFoundError(f"Model not found: {full_model_path}")
 
     checkpoint = torch.load(full_model_path, map_location=device)
     saved_args = checkpoint.get('args', {})
+    saved_var = saved_args.get('patch_var_thresh', None)
+    if saved_var is not None:
+        print(f"✓ Using patch_var_thresh from checkpoint: {saved_var}")
+        args.patch_var_thresh = float(saved_var)
 
     # 训练时 topk 以 checkpoint 为准
     saved_topk = saved_args.get('patch_topk', 1)
@@ -204,7 +257,9 @@ def load_model(model_root, device):
 
     # 加载权重
     try:
-        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        msg = model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        print("missing:", msg.missing_keys)
+        print("unexpected:", msg.unexpected_keys)
     except RuntimeError:
         print(f"⚠ Warning: Strict loading failed, trying strict=False")
         result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -310,29 +365,65 @@ def generate_gl_tta_images(img: Image.Image):
     return imgs
 
 
-def predict_one_global_local(model, device, img_pil, patch_fn, transform_fn, global_transform):
+def predict_one_global_local(model, device, img_pil, patch_fn, transform_fn, global_transform, tent_opt=None, bn_backup=None):
     patches = patch_fn(img_pil)
     patches = transform_fn(patches)  # (K,C,256,256)
     patches = patches.unsqueeze(0).to(device)  # (1,K,C,H,W)
 
     global_img = global_transform(img_pil).unsqueeze(0).to(device)  # (1,3,gs,gs)
+    b, k, c, h, w = patches.shape
+    patches_flat = patches.view(b * k, c, h, w)
 
+    # ---- TENT adaptation (optional) ----
+    if tent_opt is not None:
+        if args.tent_reset_each_image and bn_backup is not None:
+            model.load_state_dict(bn_backup, strict=False)
+
+        model.train()
+        model.apply(_set_bn_train_only)
+
+        for _ in range(max(1, args.tent_steps)):
+            tent_opt.zero_grad(set_to_none=True)
+            logits = model(patches_flat, global_img).view(-1)
+            loss = binary_entropy_from_logits(logits)
+            loss.backward()
+            tent_opt.step()
+
+        model.eval()
+        
     with torch.no_grad():
-        b, k, c, h, w = patches.shape
-        patches_flat = patches.view(b * k, c, h, w)
         logits = model(patches_flat, global_img).view(-1)  # (K,)
         prob = aggregate_patches_from_logits(logits, mode=args.patch_agg, m=args.patch_agg_m)
     return prob
 
 
-def predict_one_single_stream(model, device, img_pil, patch_fn, transform_fn):
+def predict_one_single_stream(model, device, img_pil, patch_fn, transform_fn, tent_opt=None, bn_backup=None):
     patches = patch_fn(img_pil)
     patches = transform_fn(patches)
     patches = patches.unsqueeze(0).to(device)
 
+    b, k, c, h, w = patches.shape
+    patches_flat = patches.view(b * k, c, h, w)
+
+    # ---- TENT adaptation (optional) ----
+    if tent_opt is not None:
+        if args.tent_reset_each_image and bn_backup is not None:
+            model.load_state_dict(bn_backup, strict=False)
+
+        model.train()
+        model.apply(_set_bn_train_only)
+
+        for _ in range(max(1, args.tent_steps)):
+            tent_opt.zero_grad(set_to_none=True)
+            logits = model(patches_flat).view(-1)
+            loss = binary_entropy_from_logits(logits)
+            loss.backward()
+            tent_opt.step()
+
+        model.eval()
+        
+    # ---- final prediction ----
     with torch.no_grad():
-        b, k, c, h, w = patches.shape
-        patches_flat = patches.view(b * k, c, h, w)
         logits = model(patches_flat).view(-1)  # (K,)
         prob = aggregate_patches_from_logits(logits, mode=args.patch_agg, m=args.patch_agg_m)
     return prob
@@ -370,6 +461,15 @@ def predict_test_set(model, device):
     print(f"✓ Model type: {model_class_name}")
     print(f"✓ Detected Global-Local: {is_global_local}")
 
+    tent_opt = None
+    bn_backup = None
+    if args.shift_method == 'tent':
+        params = tent_prepare(model)
+        tent_opt = torch.optim.Adam(params, lr=args.tent_lr)
+        if args.tent_reset_each_image:
+            bn_backup = copy.deepcopy(model.state_dict())
+        print(f"✓ TENT enabled: steps={args.tent_steps}, lr={args.tent_lr}, reset_each_image={args.tent_reset_each_image}")
+
     test_path = os.path.join(args.dataset_root, args.test_dir)
     if not os.path.exists(test_path):
         raise FileNotFoundError(f"Test directory not found: {test_path}")
@@ -385,6 +485,15 @@ def predict_test_set(model, device):
 
     global_transform = make_global_transform() if is_global_local else None
 
+    if args.shift_method == 'adabn':
+        imgs_for_bn = all_images
+        if args.adabn_max_images > 0:
+            imgs_for_bn = imgs_for_bn[:args.adabn_max_images]
+        for _ in range(max(1, args.adabn_passes)):
+            adabn_update_bn_stats(model, device, imgs_for_bn, is_global_local,
+                                  patch_fn, transform_fn, global_transform)
+
+
     # 预测
     probs = []
     start_time = time.time()
@@ -396,7 +505,7 @@ def predict_test_set(model, device):
             if is_global_local:
                 if args.tta_global_local and args.tta_mode != 'none':
                     tta_imgs = generate_gl_tta_images(img)
-                    prob_list = [predict_one_global_local(model, device, im, patch_fn, transform_fn, global_transform) for im in tta_imgs]
+                    prob_list = [predict_one_global_local(model, device, im, patch_fn, transform_fn, global_transform, tent_opt=tent_opt, bn_backup=bn_backup) for im in tta_imgs]
 
                     if args.tta_aggregation == 'median':
                         prob = float(np.median(prob_list))
@@ -405,10 +514,14 @@ def predict_test_set(model, device):
                         thr = args.threshold
                         votes = [1 if p > thr else 0 for p in prob_list]
                         prob = float(np.mean(votes))
+                    elif args.tta_aggregation == 'min':
+                        prob = float(np.min(prob_list))
+                    elif args.tta_aggregation == 'p25':
+                        prob = float(np.percentile(prob_list, 25))
                     else:
                         prob = float(np.mean(prob_list))
                 else:
-                    prob = predict_one_global_local(model, device, img, patch_fn, transform_fn, global_transform)
+                    prob = predict_one_global_local(model, device, img, patch_fn, transform_fn, global_transform, tent_opt=tent_opt, bn_backup=bn_backup)
 
             else:
                 # single-stream：这里先用同一套轻量TTA（和GL一致），避免依赖外部ForensicTTA
@@ -438,7 +551,7 @@ def predict_test_set(model, device):
                     else:
                         prob = float(np.mean(prob_list))
                 else:
-                    prob = predict_one_single_stream(model, device, img, patch_fn, transform_fn)
+                    prob = predict_one_single_stream(model, device, img, patch_fn, transform_fn, tent_opt=tent_opt, bn_backup=bn_backup)
 
             probs.append(prob)
 
