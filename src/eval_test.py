@@ -21,10 +21,6 @@ from utils.patch import patch_img_deterministic
 from utils.util import set_seed
 from utils.transform import PatchTransform
 
-# 如果你 single-stream 仍想用你现成的 ForensicTTA，可保留
-# from utils.tta import ForensicTTA
-
-
 parser = argparse.ArgumentParser(description='对测试集进行预测（可选TTA/阈值扫描/评估accuracy）')
 parser.add_argument('--dataset_root', default='./dataset', type=str, help='dataset root')
 parser.add_argument('--test_dir', default='test', type=str, help='test directory name')
@@ -70,12 +66,12 @@ parser.add_argument('--feature_fusion_type', default='concat', type=str,
 parser.add_argument('--patch_topk', default=5, type=int, help='top-K patches to use')
 parser.add_argument('--patch_size', default=32, type=int, help='patch size')
 
-# patch 聚合（提分关键）
+# patch 聚合
 parser.add_argument('--patch_agg', default='mean', type=str, choices=['mean', 'topm', 'logit_mean'],
                     help='how to aggregate patch predictions into image prob')
 parser.add_argument('--patch_agg_m', default=2, type=int, help='m for topm aggregation')
 
-# Global-Local 的简单TTA（让GL也能提分）
+# Global-Local 的TTA
 parser.add_argument('--tta_global_local', action='store_true', help='enable simple TTA for Global-Local models')
 parser.add_argument('--tta_jpeg_qualities', default='60,80,95', type=str, help='comma-separated jpeg qualities for GL TTA')
 parser.add_argument('--tta_hflip_gl', action='store_true', help='hflip for GL TTA')

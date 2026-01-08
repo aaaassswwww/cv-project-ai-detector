@@ -93,7 +93,7 @@ class GlobalLocalDualStream(nn.Module):
         else:
             print("✓ Using classic SRMConv2d")
             self.local_srm = SRMConv2d_simple()
-            self.srm_out_channels = 64
+            self.srm_out_channels = 3
         
         # Local fusion layer
         if fusion_mode == 'concat':

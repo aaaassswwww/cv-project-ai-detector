@@ -52,8 +52,7 @@ def collate_fn_patches(batch):
         patches = patches.clone()
         
         if k_i < max_k:
-            # 需要 padding：复制最后一个 patch 来填充
-            # 这样比用零填充更合理，避免引入全黑的 patch
+            # 需要 padding：复制最后一个 patch 来填充，避免引入全黑的 patch
             padding_needed = max_k - k_i
             last_patch = patches[-1:].repeat(padding_needed, 1, 1, 1)  # (padding_needed, 3, 256, 256)
             patches = torch.cat([patches, last_patch], dim=0)  # (K_max, 3, 256, 256)
@@ -101,8 +100,7 @@ def collate_fn_dual_stream(batch):
         local = local.clone()
         
         if k_i < max_k:
-            # 需要 padding：复制最后一个 patch 来填充
-            # 这样比用零填充更合理，避免引入全黑的 patch
+            # 需要 padding：复制最后一个 patch 来填充，避免引入全黑的 patch
             padding_needed = max_k - k_i
             last_patch = local[-1:].repeat(padding_needed, 1, 1, 1)  # (padding_needed, 3, 256, 256)
             local = torch.cat([local, last_patch], dim=0)  # (K_max, 3, 256, 256)
